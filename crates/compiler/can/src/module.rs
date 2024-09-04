@@ -494,6 +494,8 @@ pub fn canonicalize_module_defs<'a>(
                                 aliases: Default::default(),
                             };
 
+                            env.problems.extend(ensure_hosted_tasks_are_sized(&annotation));
+
                             let hosted_def = crate::task_module::build_host_exposed_def(
                                 &mut scope, *symbol, &ident, var_store, annotation,
                             );
@@ -733,6 +735,22 @@ pub fn canonicalize_module_defs<'a>(
         loc_dbgs: collected.dbgs,
         exposed_symbols,
     }
+}
+
+fn ensure_hosted_tasks_are_sized(annotation: &crate::annotation::Annotation) -> Vec<Problem> {
+    match annotation.typ.shallow_structural_dealias() {
+        Type::Function(_args, _closure_vals, ret_val) => match &ret_val {
+            &Type::Apply(ret_type_symbol, ret_type_args, region) => {
+                if ret_type_symbol == &Symbol::TASK_TASK {
+                    debug_assert!(ret_type_args.len() == 2, "Task should get 2 type args");
+
+                    
+                }
+            }
+        }
+    }
+
+    vec![]
 }
 
 fn fix_values_captured_in_closure_def(

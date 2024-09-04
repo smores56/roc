@@ -2780,6 +2780,54 @@ impl Type {
             _ => internal_error!("{}", reason),
         }
     }
+
+    pub fn is_statically_sized(&self) -> bool {
+        use Type::*;
+
+        match self {
+            Variable(v) => false,
+            Function(args, closure, ret) => {
+                ret.contains_variable(rep_variable)
+                    || closure.contains_variable(rep_variable)
+                    || args.iter().any(|arg| arg.contains_variable(rep_variable))
+            }
+            FunctionOrTagUnion(_, _, ext) => Self::contains_variable_ext(ext, rep_variable),
+            ClosureTag {
+                name: _,
+                captures,
+                ambient_function: _,
+            } => captures.iter().any(|t| t.contains_variable(rep_variable)),
+            UnspecializedLambdaSet {
+                unspecialized: Uls(v, _, _),
+            } => *v == rep_variable,
+            RecursiveTagUnion(_, tags, ext) | TagUnion(tags, ext) => {
+                Self::contains_variable_ext(ext, rep_variable)
+                    || tags
+                        .iter()
+                        .flat_map(|v| v.1.iter())
+                        .any(|arg| arg.contains_variable(rep_variable))
+            }
+
+            Record(fields, ext) => {
+                fields.iter().all(|(_field_name, field_type)| field_type.as_inner().is_statically_sized()) && ext.is_closed()
+            }
+            Tuple(elems, ext) => {
+                elems.iter().all(|(elem_index, elem_type)| elem_type.is_statically_sized()) && ext.is_closed()
+            }
+            DelayedAlias(AliasCommon { .. }) => {
+                // TODO: 123
+            }
+            Alias {
+                actual: actual_type,
+                ..
+            } => actual_type.is_statically_sized(),
+            Apply(_, args, _) => args
+                .iter()
+                .any(|arg| arg.value.contains_variable(rep_variable)),
+            RangedNumber(_) => false,
+            EmptyRec | EmptyTagUnion | Error => false,
+        }
+    }
 }
 
 struct InstantiateAliasesCtx<'a> {
