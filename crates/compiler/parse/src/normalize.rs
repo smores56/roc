@@ -785,10 +785,11 @@ impl<'a> Normalize<'a> for Expr<'a> {
                 // The formatter can remove redundant parentheses, so also remove these when normalizing for comparison.
                 a.normalize(arena)
             }
-            Expr::EmptyBlock(parent) => Expr::EmptyBlock(parent),
             Expr::MalformedIdent(a, b) => Expr::MalformedIdent(a, remove_spaces_bad_ident(b)),
             Expr::MalformedClosure => Expr::MalformedClosure,
             Expr::MalformedSuffixed(a) => Expr::MalformedSuffixed(a),
+            Expr::MalformedEmptyBlock => Expr::MalformedEmptyBlock,
+            Expr::MalformedMissingFinalExpr => Expr::MalformedMissingFinalExpr,
             Expr::PrecedenceConflict(a) => Expr::PrecedenceConflict(a),
             Expr::SpaceBefore(a, _) => a.normalize(arena),
             Expr::SpaceAfter(a, _) => a.normalize(arena),
