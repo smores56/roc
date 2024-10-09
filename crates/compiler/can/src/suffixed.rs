@@ -6,7 +6,9 @@ use roc_error_macros::internal_error;
 use roc_module::called_via::CalledVia;
 use roc_module::ident::ModuleName;
 use roc_parse::ast::Expr::{self, *};
-use roc_parse::ast::{is_expr_suffixed, Pattern, TryTarget, TypeAnnotation, ValueDef, WhenBranch};
+use roc_parse::ast::{
+    is_expr_suffixed, IfBranch, Pattern, TryTarget, TypeAnnotation, ValueDef, WhenBranch,
+};
 use roc_region::all::{Loc, Region};
 use std::cell::Cell;
 
@@ -361,29 +363,32 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
             if_thens,
             final_else: final_else_branch,
             indented_else,
+            final_else_keyword_region,
         } => {
             for (index, if_then) in if_thens.iter().enumerate() {
-                let (current_if_then_statement, current_if_then_expression) = if_then;
-
                 // unwrap suffixed (innermost) expressions e.g. `if true then doThing! then ...`
-                if is_expr_suffixed(&current_if_then_expression.value) {
-                    // split if_thens around the current index
+                if is_expr_suffixed(&if_then.consequent.value) {
+                    // split branches around the current index
                     let (before, after) = roc_parse::ast::split_around(if_thens, index);
 
-                    match unwrap_suffixed_expression(arena, current_if_then_expression, None) {
+                    match unwrap_suffixed_expression(arena, &if_then.consequent, None) {
                         Ok(unwrapped_expression) => {
-                            let mut new_if_thens = Vec::new_in(arena);
+                            let mut if_thens = Vec::new_in(arena);
 
-                            new_if_thens.extend(before);
-                            new_if_thens.push((*current_if_then_statement, *unwrapped_expression));
-                            new_if_thens.extend(after);
+                            if_thens.extend(before);
+                            if_thens.push(IfBranch {
+                                consequent: *unwrapped_expression,
+                                ..*if_then
+                            });
+                            if_thens.extend(after);
 
                             let new_if = arena.alloc(Loc::at(
                                 loc_expr.region,
                                 Expr::If {
-                                    if_thens: arena.alloc_slice_copy(new_if_thens.as_slice()),
+                                    if_thens: arena.alloc_slice_copy(if_thens.as_slice()),
                                     final_else: final_else_branch,
                                     indented_else,
+                                    final_else_keyword_region,
                                 },
                             ));
 
@@ -408,10 +413,11 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                                 target,
                             );
 
-                            let mut new_if_thens = Vec::new_in(arena);
+                            let mut new_if_thens =
+                                Vec::with_capacity_in(before.len() + 1 + after.len(), arena);
 
                             new_if_thens.extend(before);
-                            new_if_thens.push((*current_if_then_statement, *unwrapped_expression));
+                            new_if_thens.push((*current_branch_statement, *unwrapped_expression));
                             new_if_thens.extend(after);
 
                             let new_if = arena.alloc(Loc::at(
@@ -420,6 +426,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                                     if_thens: arena.alloc_slice_copy(new_if_thens.as_slice()),
                                     final_else: final_else_branch,
                                     indented_else,
+                                    final_else_keyword_region,
                                 },
                             ));
 
@@ -432,15 +439,15 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                 // unwrap suffixed statements e.g. `if isThing! then ...`
                 // note we want to split and nest if-then's so we only run Task's
                 // that are required
-                if is_expr_suffixed(&current_if_then_statement.value) {
+                if is_expr_suffixed(&if_then.condition.value) {
                     // split if_thens around the current index
                     let (before, after) = roc_parse::ast::split_around(if_thens, index);
 
-                    match unwrap_suffixed_expression(arena, current_if_then_statement, None) {
+                    match unwrap_suffixed_expression(arena, &if_then.condition, None) {
                         Ok(unwrapped_statement) => {
                             let mut new_if_thens = Vec::new_in(arena);
 
-                            new_if_thens.push((*unwrapped_statement, *current_if_then_expression));
+                            new_if_thens.push((*unwrapped_statement, *current_branch_expression));
                             new_if_thens.extend(after);
 
                             let new_if = arena.alloc(Loc::at(
@@ -448,6 +455,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                                 Expr::If {
                                     if_thens: arena.alloc_slice_copy(new_if_thens.as_slice()),
                                     final_else: final_else_branch,
+                                    final_else_keyword_region,
                                     indented_else,
                                 },
                             ));
@@ -467,7 +475,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                                 let mut new_if_thens = Vec::new_in(arena);
 
                                 new_if_thens.extend(before);
-                                new_if_thens.push((*sub_new, *current_if_then_expression));
+                                new_if_thens.push((*sub_new, *current_branch_expression));
                                 new_if_thens.extend(after);
 
                                 let new_if = arena.alloc(Loc::at(
@@ -475,6 +483,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                                     Expr::If {
                                         if_thens: arena.alloc_slice_copy(new_if_thens.as_slice()),
                                         final_else: final_else_branch,
+                                        final_else_keyword_region,
                                         indented_else,
                                     },
                                 ));
@@ -497,7 +506,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                             } else {
                                 let mut after_if_thens = Vec::new_in(arena);
 
-                                after_if_thens.push((*sub_new, *current_if_then_expression));
+                                after_if_thens.push((*sub_new, *current_branch_expression));
                                 after_if_thens.extend(after);
 
                                 let after_if = arena.alloc(Loc::at(
@@ -505,6 +514,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                                     Expr::If {
                                         if_thens: arena.alloc_slice_copy(after_if_thens.as_slice()),
                                         final_else: final_else_branch,
+                                        final_else_keyword_region,
                                         indented_else,
                                     },
                                 ));
@@ -524,6 +534,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                                     Expr::If {
                                         if_thens: before,
                                         final_else: after_if_then,
+                                        final_else_keyword_region,
                                         indented_else: false,
                                     },
                                 ));
@@ -548,6 +559,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                         Expr::If {
                             if_thens,
                             final_else: unwrapped_final_else,
+                            final_else_keyword_region,
                             indented_else,
                         },
                     )));
@@ -576,6 +588,7 @@ pub fn unwrap_suffixed_expression_if_then_else_help<'a>(
                         Expr::If {
                             if_thens,
                             final_else: unwrapped_final_else,
+                            final_else_keyword_region,
                             indented_else,
                         },
                     ));

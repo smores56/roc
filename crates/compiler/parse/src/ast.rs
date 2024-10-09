@@ -506,8 +506,9 @@ pub enum Expr<'a> {
 
     // Conditionals
     If {
-        if_thens: &'a [(Loc<Expr<'a>>, Loc<Expr<'a>>)],
+        if_thens: &'a [IfBranch<'a>],
         final_else: &'a Loc<Expr<'a>>,
+        final_else_keyword_region: Region,
         indented_else: bool,
     },
     When(
@@ -539,6 +540,14 @@ pub enum Expr<'a> {
     EmptyRecordBuilder(&'a Loc<Expr<'a>>),
     SingleFieldRecordBuilder(&'a Loc<Expr<'a>>),
     OptionalFieldInRecordBuilder(&'a Loc<&'a str>, &'a Loc<Expr<'a>>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct IfBranch<'a> {
+    pub if_keyword_region: Region,
+    pub then_keyword_region: Region,
+    pub condition: Loc<Expr<'a>>,
+    pub consequent: Loc<Expr<'a>>,
 }
 
 impl Expr<'_> {
@@ -606,15 +615,16 @@ pub fn is_expr_suffixed(expr: &Expr) -> bool {
 
         // expression in a if-then-else, `if isOk! then "ok" else doSomething!`
         Expr::If {
-            if_thens,
+            if_thens: branches,
             final_else,
             ..
         } => {
-            let any_if_thens_suffixed = if_thens.iter().any(|(if_then, else_expr)| {
-                is_expr_suffixed(&if_then.value) || is_expr_suffixed(&else_expr.value)
+            let any_branch_is_suffixed = branches.iter().any(|branch| {
+                is_expr_suffixed(&branch.condition.value)
+                    || is_expr_suffixed(&branch.consequent.value)
             });
 
-            is_expr_suffixed(&final_else.value) || any_if_thens_suffixed
+            is_expr_suffixed(&final_else.value) || any_branch_is_suffixed
         }
 
         // expression in parens `(read!)`
@@ -831,7 +841,10 @@ pub enum ValueDef<'a> {
     /// e.g. `import "path/to/my/file.txt" as myFile : Str`
     IngestedFileImport(IngestedFileImport<'a>),
 
-    Stmt(&'a Loc<Expr<'a>>),
+    Stmt {
+        body: &'a Loc<Expr<'a>>,
+        is_suffixed: bool,
+    },
 }
 
 impl<'a> ValueDef<'a> {
@@ -961,15 +974,15 @@ impl<'a, 'b> RecursiveValueDefIter<'a, 'b> {
                 }
                 UnaryOp(expr, _) => expr_stack.push(&expr.value),
                 If {
-                    if_thens,
+                    if_thens: branches,
                     final_else,
                     ..
                 } => {
-                    expr_stack.reserve(if_thens.len() * 2 + 1);
+                    expr_stack.reserve(branches.len() * 2 + 1);
 
-                    for (condition, consequent) in if_thens.iter() {
-                        expr_stack.push(&condition.value);
-                        expr_stack.push(&consequent.value);
+                    for branch in branches.iter() {
+                        expr_stack.push(&branch.condition.value);
+                        expr_stack.push(&branch.consequent.value);
                     }
                     expr_stack.push(&final_else.value);
                 }
@@ -1075,7 +1088,9 @@ impl<'a, 'b> Iterator for RecursiveValueDefIter<'a, 'b> {
                                 }
                             }
                         }
-                        ValueDef::Stmt(loc_expr) => self.push_pending_from_expr(&loc_expr.value),
+                        ValueDef::Stmt { body: loc_expr, .. } => {
+                            self.push_pending_from_expr(&loc_expr.value)
+                        }
                         ValueDef::Annotation(_, _) | ValueDef::IngestedFileImport(_) => {}
                     }
 
@@ -1256,7 +1271,7 @@ impl<'a> Defs<'a> {
                         },
                         loc_expr,
                     ) if collection.is_empty() => Some((tag_index, loc_expr)),
-                    ValueDef::Stmt(loc_expr) => Some((tag_index, loc_expr)),
+                    ValueDef::Stmt { body: loc_expr, .. } => Some((tag_index, loc_expr)),
                     _ => None,
                 },
             });
@@ -2474,7 +2489,7 @@ impl<'a> Malformed for Expr<'a> {
             Apply(func, args, _) => func.is_malformed() || args.iter().any(|arg| arg.is_malformed()),
             BinOps(firsts, last) => firsts.iter().any(|(expr, _)| expr.is_malformed()) || last.is_malformed(),
             UnaryOp(expr, _) => expr.is_malformed(),
-            If { if_thens, final_else, ..} => if_thens.iter().any(|(cond, body)| cond.is_malformed() || body.is_malformed()) || final_else.is_malformed(),
+            If { if_thens: branches, final_else, ..} => branches.iter().any(|branch| branch.condition.is_malformed() || branch.consequent.is_malformed()) || final_else.is_malformed(),
             When(cond, branches) => cond.is_malformed() || branches.iter().any(|branch| branch.is_malformed()),
 
             SpaceBefore(expr, _) |
@@ -2724,7 +2739,7 @@ impl<'a> Malformed for ValueDef<'a> {
                 name: _,
                 annotation,
             }) => path.is_malformed() || annotation.is_malformed(),
-            ValueDef::Stmt(loc_expr) => loc_expr.is_malformed(),
+            ValueDef::Stmt { body: loc_expr, .. } => loc_expr.is_malformed(),
         }
     }
 }

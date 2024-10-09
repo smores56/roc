@@ -3,6 +3,7 @@ use bumpalo::Bump;
 use roc_module::called_via::{BinOp, UnaryOp};
 use roc_region::all::{Loc, Position, Region};
 
+use crate::ast::IfBranch;
 use crate::{
     ast::{
         AbilityImpls, AbilityMember, AssignedField, Collection, Defs, Expr, FullAst, Header,
@@ -396,9 +397,9 @@ impl<'a> Normalize<'a> for ValueDef<'a> {
 
         match *self {
             Annotation(a, b) => Annotation(a.normalize(arena), b.normalize(arena)),
-            Body(a, b) => Body(
-                arena.alloc(a.normalize(arena)),
-                arena.alloc(b.normalize(arena)),
+            Body(pat, body) => Body(
+                arena.alloc(pat.normalize(arena)),
+                arena.alloc(body.normalize(arena)),
             ),
             AnnotatedBody {
                 ann_pattern,
@@ -438,7 +439,13 @@ impl<'a> Normalize<'a> for ValueDef<'a> {
             IngestedFileImport(ingested_file_import) => {
                 IngestedFileImport(ingested_file_import.normalize(arena))
             }
-            Stmt(loc_expr) => Stmt(arena.alloc(loc_expr.normalize(arena))),
+            Stmt {
+                body: loc_expr,
+                is_suffixed,
+            } => Stmt {
+                body: arena.alloc(loc_expr.normalize(arena)),
+                is_suffixed,
+            },
         }
     }
 }
@@ -774,10 +781,12 @@ impl<'a> Normalize<'a> for Expr<'a> {
             Expr::If {
                 if_thens,
                 final_else,
+                final_else_keyword_region,
                 indented_else,
             } => Expr::If {
                 if_thens: if_thens.normalize(arena),
                 final_else: arena.alloc(final_else.normalize(arena)),
+                final_else_keyword_region,
                 indented_else,
             },
             Expr::When(a, b) => Expr::When(arena.alloc(a.normalize(arena)), b.normalize(arena)),
@@ -992,6 +1001,17 @@ impl<'a> Normalize<'a> for PatternAs<'a> {
         PatternAs {
             spaces_before: &[],
             identifier: self.identifier.normalize(arena),
+        }
+    }
+}
+
+impl<'a> Normalize<'a> for IfBranch<'a> {
+    fn normalize(&self, arena: &'a Bump) -> Self {
+        IfBranch {
+            if_keyword_region: self.if_keyword_region,
+            then_keyword_region: self.then_keyword_region,
+            condition: self.condition.normalize(arena),
+            consequent: self.consequent.normalize(arena),
         }
     }
 }

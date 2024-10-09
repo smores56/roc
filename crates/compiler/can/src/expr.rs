@@ -22,7 +22,7 @@ use roc_module::symbol::{IdentId, ModuleId, Symbol};
 use roc_parse::ast::{self, Defs, PrecedenceConflict, StrLiteral};
 use roc_parse::ident::Accessor;
 use roc_parse::pattern::PatternType::*;
-use roc_problem::can::{PrecedenceProblem, Problem, RuntimeError};
+use roc_problem::can::{EmptyBlockParent, PrecedenceProblem, Problem, RuntimeError};
 use roc_region::all::{Loc, Region};
 use roc_types::num::SingleQuoteBound;
 use roc_types::subs::{ExhaustiveMark, IllegalCycleMark, RedundantMark, VarStore, Variable};
@@ -1266,22 +1266,55 @@ pub fn canonicalize_expr<'a>(
             let mut branches = Vec::with_capacity(if_thens.len());
             let mut output = Output::default();
 
-            for (condition, then_branch) in if_thens.iter() {
-                let (loc_cond, cond_output) =
-                    canonicalize_expr(env, var_store, scope, condition.region, &condition.value);
+            for if_then in if_thens.iter() {
+                let (loc_condition, condition_output) =
+                    if &if_then.condition.value == &ast::Expr::MalformedEmptyBlock {
+                        (
+                            Loc {
+                                region: if_then.if_keyword_region,
+                                value: RuntimeError(roc_problem::can::RuntimeError::EmptyBlock(
+                                    EmptyBlockParent::IfCondition,
+                                    if_then.if_keyword_region,
+                                )),
+                            },
+                            Output::default(),
+                        )
+                    } else {
+                        canonicalize_expr(
+                            env,
+                            var_store,
+                            scope,
+                            if_then.condition.region,
+                            &if_then.condition.value,
+                        )
+                    };
 
-                let (loc_then, then_output) = canonicalize_expr(
-                    env,
-                    var_store,
-                    scope,
-                    then_branch.region,
-                    &then_branch.value,
-                );
+                let (loc_consequent, consequent_output) =
+                    if &if_then.consequent.value == &ast::Expr::MalformedEmptyBlock {
+                        (
+                            Loc {
+                                region: if_then.then_keyword_region,
+                                value: RuntimeError(roc_problem::can::RuntimeError::EmptyBlock(
+                                    EmptyBlockParent::IfBlock,
+                                    if_then.then_keyword_region,
+                                )),
+                            },
+                            Output::default(),
+                        )
+                    } else {
+                        canonicalize_expr(
+                            env,
+                            var_store,
+                            scope,
+                            if_then.consequent.region,
+                            &if_then.consequent.value,
+                        )
+                    };
 
-                branches.push((loc_cond, loc_then));
+                branches.push((loc_condition, loc_consequent));
 
-                output.references.union_mut(&cond_output.references);
-                output.references.union_mut(&then_output.references);
+                output.references.union_mut(&condition_output.references);
+                output.references.union_mut(&consequent_output.references);
             }
 
             let (loc_else, else_output) = canonicalize_expr(
@@ -1337,14 +1370,6 @@ pub fn canonicalize_expr<'a>(
                 Output::default(),
             )
         }
-        ast::Expr::EmptyBlock(parent) => {
-            use roc_problem::can::RuntimeError::*;
-
-            let problem = EmptyBlock(*parent, region);
-            env.problem(Problem::RuntimeError(problem.clone()));
-
-            (RuntimeError(problem), Output::default())
-        }
         ast::Expr::MalformedClosure => {
             use roc_problem::can::RuntimeError::*;
             (RuntimeError(MalformedClosure(region)), Output::default())
@@ -1360,6 +1385,9 @@ pub fn canonicalize_expr<'a>(
         ast::Expr::MalformedSuffixed(..) => {
             use roc_problem::can::RuntimeError::*;
             (RuntimeError(MalformedSuffixed(region)), Output::default())
+        }
+        ast::Expr::MalformedEmptyBlock => {
+            internal_error!("Malformed empty block should have been desugared by a block parent")
         }
         ast::Expr::EmptyRecordBuilder(sub_expr) => {
             use roc_problem::can::RuntimeError::*;
@@ -2499,7 +2527,8 @@ pub fn is_valid_interpolation(expr: &ast::Expr<'_>) -> bool {
         | ast::Expr::Tag(_)
         | ast::Expr::OpaqueRef(_)
         | ast::Expr::MalformedClosure
-        | ast::Expr::EmptyBlock(_) => true,
+        | ast::Expr::MalformedEmptyBlock
+        | ast::Expr::MalformedMissingFinalExpr => true,
         // Newlines are disallowed inside interpolation, and these all require newlines
         ast::Expr::DbgStmt(_, _)
         | ast::Expr::LowLevelDbg(_, _, _)
@@ -2565,14 +2594,14 @@ pub fn is_valid_interpolation(expr: &ast::Expr<'_>) -> bool {
                     .all(|(loc_expr, _binop)| is_valid_interpolation(&loc_expr.value))
         }
         ast::Expr::If {
-            if_thens: branches,
+            if_thens,
             final_else: final_branch,
             ..
         } => {
             is_valid_interpolation(&final_branch.value)
-                && branches.iter().all(|(loc_before, loc_after)| {
-                    is_valid_interpolation(&loc_before.value)
-                        && is_valid_interpolation(&loc_after.value)
+                && if_thens.iter().all(|if_then| {
+                    is_valid_interpolation(&if_then.condition.value)
+                        && is_valid_interpolation(&if_then.consequent.value)
                 })
         }
         ast::Expr::List(elems) => elems

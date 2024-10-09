@@ -5,7 +5,7 @@ use roc_collections::all::MutSet;
 use roc_module::called_via::BinOp;
 use roc_module::ident::{Ident, Lowercase, ModuleName, TagName};
 use roc_module::symbol::{ModuleId, Symbol};
-use roc_parse::ast::{Base, EmptyBlockParent};
+use roc_parse::ast::Base;
 use roc_parse::pattern::PatternType;
 use roc_region::all::{Loc, Region};
 use roc_types::types::AliasKind;
@@ -695,6 +695,13 @@ pub enum RuntimeError {
     },
 
     MalformedSuffixed(Region),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmptyBlockParent {
+    IfCondition,
+    IfBlock,
+    ElseBlock,
 }
 
 impl RuntimeError {
