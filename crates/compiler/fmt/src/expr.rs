@@ -10,7 +10,7 @@ use crate::Buf;
 use roc_module::called_via::{self, BinOp};
 use roc_parse::ast::{
     is_expr_suffixed, AssignedField, Base, Collection, CommentOrNewline, Expr, ExtractSpaces,
-    Pattern, TryTarget, WhenBranch,
+    IfBranch, Pattern, TryTarget, WhenBranch,
 };
 use roc_parse::ast::{StrLiteral, StrSegment};
 use roc_parse::ident::Accessor;
@@ -42,9 +42,10 @@ impl<'a> Formattable for Expr<'a> {
             | RecordUpdater(_)
             | Var { .. }
             | Underscore { .. }
-            | EmptyBlock(_)
             | MalformedIdent(_, _)
             | MalformedClosure
+            | MalformedMissingFinalExpr
+            | MalformedEmptyBlock
             | Tag(_)
             | OpaqueRef(_)
             | Crash
@@ -73,14 +74,14 @@ impl<'a> Formattable for Expr<'a> {
             ),
 
             If {
-                if_thens: branches,
+                if_thens,
                 final_else,
                 ..
             } => {
                 final_else.is_multiline()
-                    || branches
-                        .iter()
-                        .any(|(c, t)| c.is_multiline() || t.is_multiline())
+                    || if_thens.iter().any(|if_then| {
+                        if_then.condition.is_multiline() || if_then.consequent.is_multiline()
+                    })
             }
 
             BinOps(lefts, loc_right) => {
@@ -457,6 +458,7 @@ impl<'a> Formattable for Expr<'a> {
                 if_thens: branches,
                 final_else,
                 indented_else,
+                ..
             } => {
                 fmt_if(
                     buf,
@@ -546,8 +548,9 @@ impl<'a> Formattable for Expr<'a> {
                 buf.indent(indent);
                 loc_expr.format_with_options(buf, parens, newlines, indent);
             }
-            EmptyBlock(_) => {}
             MalformedClosure => {}
+            MalformedEmptyBlock => {}
+            MalformedMissingFinalExpr => {}
             PrecedenceConflict { .. } => {}
             EmptyRecordBuilder { .. } => {}
             SingleFieldRecordBuilder { .. } => {}
@@ -1068,7 +1071,7 @@ fn fmt_expect<'a>(
 
 fn fmt_if<'a>(
     buf: &mut Buf,
-    branches: &'a [(Loc<Expr<'a>>, Loc<Expr<'a>>)],
+    branches: &'a [IfBranch<'a>],
     final_else: &'a Loc<Expr<'a>>,
     is_multiline: bool,
     indented_else: bool,
@@ -1085,8 +1088,8 @@ fn fmt_if<'a>(
         indent
     };
 
-    for (i, (loc_condition, loc_then)) in branches.iter().enumerate() {
-        let is_multiline_condition = loc_condition.is_multiline();
+    for (i, branch) in branches.iter().enumerate() {
+        let is_multiline_condition = branch.condition.is_multiline();
 
         buf.indent(indent);
 
@@ -1098,7 +1101,7 @@ fn fmt_if<'a>(
         buf.push_str("if");
 
         if is_multiline_condition {
-            match &loc_condition.value {
+            match &branch.condition.value {
                 Expr::SpaceBefore(expr_below, spaces_before_expr) => {
                     fmt_comments_only(
                         buf,
@@ -1147,21 +1150,23 @@ fn fmt_if<'a>(
 
                 _ => {
                     buf.newline();
-                    loc_condition.format(buf, return_indent);
+                    branch.condition.format(buf, return_indent);
                     buf.newline();
                 }
             }
             buf.indent(indent);
         } else {
             buf.spaces(1);
-            loc_condition.format_with_options(buf, Parens::NotNeeded, Newlines::Yes, indent);
+            branch
+                .condition
+                .format_with_options(buf, Parens::NotNeeded, Newlines::Yes, indent);
             buf.spaces(1);
         }
 
         buf.push_str("then");
 
         if is_multiline {
-            match &loc_then.value {
+            match &branch.consequent.value {
                 Expr::SpaceBefore(expr_below, spaces_below) => {
                     // we want exactly one newline, user-inserted extra newlines are ignored.
                     buf.newline();
@@ -1193,14 +1198,14 @@ fn fmt_if<'a>(
                 }
                 _ => {
                     buf.newline();
-                    loc_then.format(buf, return_indent);
+                    branch.consequent.format(buf, return_indent);
                     buf.newline();
                 }
             }
         } else {
             buf.push_str("");
             buf.spaces(1);
-            loc_then.format(buf, return_indent);
+            branch.consequent.format(buf, return_indent);
         }
     }
 

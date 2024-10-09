@@ -3283,7 +3283,7 @@ fn to_pending_value_def<'a>(
 
             PendingValue::Def(PendingValueDef::IngestedFile(loc_pattern, ingested_file.annotation.map(|ann| ann.annotation), ingested_file.path))
         }
-        Stmt(_) => internal_error!("a Stmt was not desugared correctly, should have been converted to a Body(...) in desguar"),
+        Stmt { .. } => internal_error!("a Stmt was not desugared correctly, should have been converted to a Body(...) in desguar"),
     }
 }
 

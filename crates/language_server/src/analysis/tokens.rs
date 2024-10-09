@@ -5,9 +5,9 @@ use bumpalo::{
 use roc_module::called_via::{BinOp, UnaryOp};
 use roc_parse::{
     ast::{
-        AbilityImpls, AbilityMember, AssignedField, Collection, Defs, Expr, Header, Implements,
-        ImplementsAbilities, ImplementsAbility, ImplementsClause, Pattern, PatternAs, Spaced,
-        StrLiteral, Tag, TypeAnnotation, TypeDef, TypeHeader, ValueDef, WhenBranch,
+        AbilityImpls, AbilityMember, AssignedField, Collection, Defs, Expr, Header, IfBranch,
+        Implements, ImplementsAbilities, ImplementsAbility, ImplementsClause, Pattern, PatternAs,
+        Spaced, StrLiteral, Tag, TypeAnnotation, TypeDef, TypeHeader, ValueDef, WhenBranch,
     },
     header::{
         AppHeader, ExposedName, HostedHeader, ImportsEntry, ModuleHeader, ModuleName, ModuleParams,
@@ -725,7 +725,8 @@ impl IterTokens for Loc<Expr<'_>> {
             Expr::EmptyRecordBuilder(e) => e.iter_tokens(arena),
             Expr::SingleFieldRecordBuilder(e) => e.iter_tokens(arena),
             Expr::OptionalFieldInRecordBuilder(_name, e) => e.iter_tokens(arena),
-            Expr::EmptyBlock(_)
+            Expr::MalformedEmptyBlock
+            | Expr::MalformedMissingFinalExpr
             | Expr::MalformedIdent(_, _)
             | Expr::MalformedClosure
             | Expr::PrecedenceConflict(_)
@@ -742,6 +743,20 @@ impl IterTokens for Loc<Accessor<'_>> {
             Accessor::RecordField(_) => onetoken(Token::Function, self.region, arena),
             Accessor::TupleIndex(_) => onetoken(Token::Function, self.region, arena),
         }
+    }
+}
+
+impl IterTokens for IfBranch<'_> {
+    fn iter_tokens<'a>(&self, arena: &'a Bump) -> BumpVec<'a, Loc<Token>> {
+        let IfBranch {
+            condition,
+            consequent,
+            ..
+        } = self;
+
+        (condition.iter_tokens(arena).into_iter())
+            .chain(consequent.iter_tokens(arena))
+            .collect_in(arena)
     }
 }
 

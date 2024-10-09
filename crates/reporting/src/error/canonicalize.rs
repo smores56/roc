@@ -2,11 +2,10 @@ use roc_collections::all::MutSet;
 use roc_module::called_via::Suffix;
 use roc_module::ident::{Ident, Lowercase, ModuleName};
 use roc_module::symbol::DERIVABLE_ABILITIES;
-use roc_parse::ast::EmptyBlockParent;
 use roc_problem::can::PrecedenceProblem::BothNonAssociative;
 use roc_problem::can::{
-    BadPattern, CycleEntry, ExtensionTypeKind, FloatErrorKind, IntErrorKind, Problem, RuntimeError,
-    ScopeModuleSource, ShadowKind,
+    BadPattern, CycleEntry, EmptyBlockParent, ExtensionTypeKind, FloatErrorKind, IntErrorKind,
+    Problem, RuntimeError, ScopeModuleSource, ShadowKind,
 };
 use roc_problem::Severity;
 use roc_region::all::{LineColumn, LineColumnRegion, LineInfo, Loc, Region};
@@ -2084,9 +2083,11 @@ fn pretty_runtime_error<'b>(
         }
         RuntimeError::EmptyBlock(parent, region) => {
             let parent_name = match parent {
-                EmptyBlockParent::IfBranch => "if branch",
-                EmptyBlockParent::ElseBranch => "else branch",
-                EmptyBlockParent::WhenBranch => "when branch",
+                EmptyBlockParent::IfCondition => "if condition",
+                EmptyBlockParent::IfConsequent => "if branch",
+                EmptyBlockParent::ElseBlock => "else branch",
+                EmptyBlockParent::WhenPattern => "when pattern",
+                EmptyBlockParent::WhenBlock => "when branch",
                 EmptyBlockParent::Closure => "function",
                 EmptyBlockParent::Definition => "definition",
             };
@@ -2098,10 +2099,18 @@ fn pretty_runtime_error<'b>(
                     alloc.reflow(" has no body:"),
                 ]),
                 alloc.region(lines.convert_region(region), severity),
-                alloc.text("I would need to crash if I used it!"),
             ]);
 
             title = "MISSING BODY";
+        }
+        RuntimeError::MissingFinalExpr(region) => {
+            doc = alloc.stack([
+                alloc.concat([alloc.reflow("This block is missing a final expression:")]),
+                alloc.region(lines.convert_region(region), severity),
+                alloc.text("Without it, I don't know which value to use from this block!"),
+            ]);
+
+            title = "MISSING FINAL EXPRESSION";
         }
         RuntimeError::InvalidFloat(sign @ FloatErrorKind::PositiveInfinity, region, _raw_str)
         | RuntimeError::InvalidFloat(sign @ FloatErrorKind::NegativeInfinity, region, _raw_str) => {

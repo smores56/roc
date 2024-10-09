@@ -267,6 +267,14 @@ pub enum Header<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IfBranch<'a> {
+    pub if_keyword_region: Region,
+    pub then_keyword_region: Region,
+    pub condition: Loc<Expr<'a>>,
+    pub consequent: Loc<Expr<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WhenBranch<'a> {
     pub patterns: &'a [Loc<Pattern<'a>>],
     pub value: Loc<Expr<'a>>,
@@ -506,8 +514,9 @@ pub enum Expr<'a> {
 
     // Conditionals
     If {
-        if_thens: &'a [(Loc<Expr<'a>>, Loc<Expr<'a>>)],
+        if_thens: &'a [IfBranch<'a>],
         final_else: &'a Loc<Expr<'a>>,
+        final_else_keyword_region: Region,
         indented_else: bool,
     },
     When(
@@ -606,15 +615,16 @@ pub fn is_expr_suffixed(expr: &Expr) -> bool {
 
         // expression in a if-then-else, `if isOk! then "ok" else doSomething!`
         Expr::If {
-            if_thens,
+            if_thens: branches,
             final_else,
             ..
         } => {
-            let any_if_thens_suffixed = if_thens.iter().any(|(if_then, else_expr)| {
-                is_expr_suffixed(&if_then.value) || is_expr_suffixed(&else_expr.value)
+            let any_branch_is_suffixed = branches.iter().any(|branch| {
+                is_expr_suffixed(&branch.condition.value)
+                    || is_expr_suffixed(&branch.consequent.value)
             });
 
-            is_expr_suffixed(&final_else.value) || any_if_thens_suffixed
+            is_expr_suffixed(&final_else.value) || any_branch_is_suffixed
         }
 
         // expression in parens `(read!)`
@@ -961,15 +971,15 @@ impl<'a, 'b> RecursiveValueDefIter<'a, 'b> {
                 }
                 UnaryOp(expr, _) => expr_stack.push(&expr.value),
                 If {
-                    if_thens,
+                    if_thens: branches,
                     final_else,
                     ..
                 } => {
-                    expr_stack.reserve(if_thens.len() * 2 + 1);
+                    expr_stack.reserve(branches.len() * 2 + 1);
 
-                    for (condition, consequent) in if_thens.iter() {
-                        expr_stack.push(&condition.value);
-                        expr_stack.push(&consequent.value);
+                    for branch in branches.iter() {
+                        expr_stack.push(&branch.condition.value);
+                        expr_stack.push(&branch.consequent.value);
                     }
                     expr_stack.push(&final_else.value);
                 }
@@ -2474,7 +2484,7 @@ impl<'a> Malformed for Expr<'a> {
             Apply(func, args, _) => func.is_malformed() || args.iter().any(|arg| arg.is_malformed()),
             BinOps(firsts, last) => firsts.iter().any(|(expr, _)| expr.is_malformed()) || last.is_malformed(),
             UnaryOp(expr, _) => expr.is_malformed(),
-            If { if_thens, final_else, ..} => if_thens.iter().any(|(cond, body)| cond.is_malformed() || body.is_malformed()) || final_else.is_malformed(),
+            If { if_thens: branches, final_else, ..} => branches.iter().any(|branch| branch.condition.is_malformed() || branch.consequent.is_malformed()) || final_else.is_malformed(),
             When(cond, branches) => cond.is_malformed() || branches.iter().any(|branch| branch.is_malformed()),
 
             SpaceBefore(expr, _) |

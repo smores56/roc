@@ -11,7 +11,7 @@ use roc_module::called_via::{BinOp, CalledVia};
 use roc_module::ident::ModuleName;
 use roc_parse::ast::Expr::{self, *};
 use roc_parse::ast::{
-    AssignedField, Collection, Defs, ModuleImportParams, Pattern, StrLiteral, StrSegment,
+    AssignedField, Collection, Defs, IfBranch, ModuleImportParams, Pattern, StrLiteral, StrSegment,
     TypeAnnotation, ValueDef, WhenBranch,
 };
 use roc_problem::can::Problem;
@@ -294,7 +294,7 @@ pub fn desugar_value_def_suffixed<'a>(arena: &'a Bump, value_def: ValueDef<'a>) 
         Dbg { .. } | Expect { .. } | ExpectFx { .. } => value_def,
         ModuleImport { .. } | IngestedFileImport(_) => value_def,
 
-        Stmt(..) => {
+        Stmt { .. } => {
             internal_error!(
                 "this should have been desugared into a Body(..) before this call in desugar_expr"
             )
@@ -317,10 +317,11 @@ pub fn desugar_expr<'a>(
         | AccessorFunction(_)
         | Var { .. }
         | Underscore { .. }
-        | EmptyBlock(_)
         | MalformedIdent(_, _)
         | MalformedClosure
         | MalformedSuffixed(..)
+        | MalformedEmptyBlock
+        | MalformedMissingFinalExpr
         | PrecedenceConflict { .. }
         | EmptyRecordBuilder(_)
         | SingleFieldRecordBuilder(_)
@@ -958,6 +959,7 @@ pub fn desugar_expr<'a>(
         If {
             if_thens,
             final_else,
+            final_else_keyword_region,
             indented_else,
         } => {
             // If does not get desugared into `when` so we can give more targeted error messages during type checking.
@@ -965,17 +967,23 @@ pub fn desugar_expr<'a>(
 
             let mut desugared_if_thens = Vec::with_capacity_in(if_thens.len(), env.arena);
 
-            for (condition, then_branch) in if_thens.iter() {
-                let desugared_condition = *desugar_expr(env, scope, condition);
-                let desugared_then_branch = *desugar_expr(env, scope, then_branch);
+            for if_then in if_thens.iter() {
+                let desugared_condition = *desugar_expr(env, scope, &if_then.condition);
+                let desugared_then_branch = *desugar_expr(env, scope, &if_then.consequent);
 
-                desugared_if_thens.push((desugared_condition, desugared_then_branch));
+                desugared_if_thens.push(IfBranch {
+                    condition: desugared_condition,
+                    consequent: desugared_then_branch,
+                    if_keyword_region: if_then.if_keyword_region,
+                    then_keyword_region: if_then.then_keyword_region,
+                });
             }
 
             env.arena.alloc(Loc {
                 value: If {
                     if_thens: desugared_if_thens.into_bump_slice(),
                     final_else: desugared_final_else,
+                    final_else_keyword_region: *final_else_keyword_region,
                     indented_else: *indented_else,
                 },
                 region: loc_expr.region,
