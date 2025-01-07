@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/compiler/*",
+    "crates/check/*",
     "crates/vendor/*",
     "crates/fs",
     "crates/glue",
