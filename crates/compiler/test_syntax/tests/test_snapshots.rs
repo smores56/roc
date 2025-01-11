@@ -33,6 +33,9 @@ mod test_snapshots {
         (full => $input:expr) => {
             Input::Full($input)
         };
+        (pattern => $input:expr) => {
+            Input::Pattern($input)
+        };
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +190,7 @@ mod test_snapshots {
         fail/ability_first_demand_not_indented_enough.expr,
         fail/ability_non_signature_expression.expr,
         fail/alias_or_opaque_fail.expr,
+        fail/all_the_bangs.expr,
         fail/bound_variable.expr,
         fail/comment_with_tab.expr,
         fail/d_assign_return_bang.expr,
@@ -292,12 +296,12 @@ mod test_snapshots {
         pass/alias_comment_after_head.expr,
         pass/alias_parens_comment.expr,
         pass/alias_parens_comment_indent.expr,
-        pass/all_the_bangs.expr,
         pass/ann_apply_record_with_newlines.expr,
         pass/ann_closed_union.expr,
         pass/ann_effectful_fn.expr,
         pass/ann_open_union.expr,
         pass/ann_parens_comments.expr,
+        pass/ann_parens_where_implements_func.expr,
         pass/ann_pattern_comment_before_body.expr,
         pass/ann_record_pat_with_comment.expr,
         pass/ann_tag_union_newline_comment.expr,
@@ -323,9 +327,13 @@ mod test_snapshots {
         pass/apply_record_ann.expr,
         pass/apply_record_parens_newline_field.expr,
         pass/apply_tag.expr,
+        pass/apply_tag_pnc.expr,
+        pass/apply_tag_single_arg_pnc.pattern,
+        pass/apply_tag_single_arg_whitespace.pattern,
         pass/apply_three_args.expr,
         pass/apply_tuple_ext_parens_ty.expr,
         pass/apply_two_args.expr,
+        pass/apply_two_args_pnc.expr,
         pass/apply_unary_negation.expr,
         pass/apply_unary_not.expr,
         pass/arg_pattern_as.expr,
@@ -363,6 +371,7 @@ mod test_snapshots {
         pass/comment_after_def.moduledefs,
         pass/comment_after_expr_in_parens.expr,
         pass/comment_after_op.expr,
+        pass/comment_after_whitespace_apply_arg_inside_pnc_apply.expr,
         pass/comment_before_colon_def.expr,
         pass/comment_before_comma_in_tuple_type_with_func.expr,
         pass/comment_before_equals_def.expr,
@@ -388,6 +397,8 @@ mod test_snapshots {
         pass/dbg_double_newline.expr,
         pass/dbg_extra_parens.expr,
         pass/dbg_newline_apply.expr,
+        pass/dbg_pnc_a_over_a.expr,
+        pass/dbg_pnc_zero_args.expr,
         pass/dbg_stmt.expr,
         pass/dbg_stmt_in_parens.expr,
         pass/dbg_stmt_multiline.expr,
@@ -448,7 +459,7 @@ mod test_snapshots {
         pass/if_in_record_field_opt_pat.expr,
         pass/if_newline_then_negate_else_recordupdater.expr,
         pass/if_then_weird_indent.expr,
-        pass/implements_after_parens_comment.expr,
+        pass/implements_after_comment_with_newline.expr,
         pass/implements_annotation_comment.expr,
         pass/implements_in_pat_after_comment.expr,
         pass/implements_newline_in_fn_ty.expr,
@@ -479,6 +490,7 @@ mod test_snapshots {
         pass/list_minus_newlines.expr,
         pass/list_pattern_weird_indent.expr,
         pass/list_patterns.expr,
+        pass/long_complex_application_with_pnc.expr,
         pass/looks_like_implements.expr,
         pass/lowest_float.expr,
         pass/lowest_int.expr,
@@ -543,6 +555,7 @@ mod test_snapshots {
         pass/newline_after_sub.expr,
         pass/newline_and_spaces_before_less_than.expr,
         pass/newline_before_add.expr,
+        pass/newline_before_and_after_implements_opaque.expr,
         pass/newline_before_import_curlies.expr,
         pass/newline_before_sub.expr,
         pass/newline_in_packages.full,
@@ -620,6 +633,8 @@ mod test_snapshots {
         pass/pizza_question.moduledefs,
         pass/plus_if.expr,
         pass/plus_when.expr,
+        pass/pnc_apply_comment_after_newline.expr,
+        pass/pnc_parens_apply_etc.expr,
         pass/pos_inf_float.expr,
         pass/positive_float.expr,
         pass/positive_int.expr,
@@ -657,6 +672,7 @@ mod test_snapshots {
         pass/return_multiline.expr,
         pass/return_only_statement.expr,
         pass/return_parens_comments.expr,
+        pass/return_record_update_comment_empty_fields.expr,
         pass/return_then_nested_parens.expr,
         pass/return_with_after.expr,
         pass/separate_defs.moduledefs,
@@ -768,15 +784,12 @@ mod test_snapshots {
 
     /// Does the given test name expect the canonicalization process to panic?
     fn expect_canonicalize_panics(test_name: &str) -> bool {
+        #[allow(clippy::match_single_binding)]
         match test_name {
             // This is the current list as of writing.
             // We should be driving these down to zero over time.
             // Adding this protection in now to avoid accidentally adding more.
-            "all_the_bangs" | "bangs_and_tuple_accessors" => {
-                // both of these result in:
-                // "a Expr::TrySuffix expression was not completely removed in desugar_value_def_suffixed"
-                true
-            }
+            // NOTHING FOR NOW!
 
             // When adding new snapshot tests, strongly prefer fixing any canonicalization panics
             // they may run into rather than adding them to this list.
@@ -855,8 +868,6 @@ mod test_snapshots {
             }
             Err(err) => Err(format!("{err:?}")),
         };
-
-        println!("{:?}", result);
 
         if expect == TestExpectation::Pass {
             let tokens = roc_parse::highlight::highlight(&source);
@@ -1025,7 +1036,7 @@ mod test_snapshots {
 
     #[test]
     fn string_with_interpolation_in_middle() {
-        assert_segments(r#""Hi, $(name)!""#, |arena| {
+        assert_segments(r#""Hi, ${name}!""#, |arena| {
             let expr = arena.alloc(Var {
                 module_name: "",
                 ident: "name",
@@ -1041,7 +1052,7 @@ mod test_snapshots {
 
     #[test]
     fn string_with_interpolation_in_front() {
-        assert_segments(r#""$(name), hi!""#, |arena| {
+        assert_segments(r#""${name}, hi!""#, |arena| {
             let expr = arena.alloc(Var {
                 module_name: "",
                 ident: "name",
@@ -1056,7 +1067,7 @@ mod test_snapshots {
 
     #[test]
     fn string_with_interpolation_in_back() {
-        assert_segments(r#""Hello $(name)""#, |arena| {
+        assert_segments(r#""Hello ${name}""#, |arena| {
             let expr = arena.alloc(Var {
                 module_name: "",
                 ident: "name",
@@ -1071,7 +1082,7 @@ mod test_snapshots {
 
     #[test]
     fn string_with_multiple_interpolations() {
-        assert_segments(r#""Hi, $(name)! How is $(project) going?""#, |arena| {
+        assert_segments(r#""Hi, ${name}! How is ${project} going?""#, |arena| {
             let expr1 = arena.alloc(Var {
                 module_name: "",
                 ident: "name",

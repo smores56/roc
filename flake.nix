@@ -30,8 +30,10 @@
       supportedSystems = [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" "aarch64-linux" ];
 
       templates = import ./nix/templates { };
-    in
-    { inherit templates; } //
+    in {
+      inherit templates;
+      lib = { buildRocPackage = import ./nix/buildRocPackage.nix; };
+    } //
     flake-utils.lib.eachSystem supportedSystems (system:
       let
 
@@ -59,6 +61,7 @@
             xorg.libXi
             xorg.libxcb
             cargo-llvm-cov # to visualize code coverage
+
           ];
 
         # DevInputs are not necessary to build roc as a user
@@ -75,6 +78,8 @@
           cmake
           # provides llvm
           llvmPkgs.dev
+          # for debugging:
+          # lldb
           # faster builds - see https://github.com/roc-lang/roc/blob/main/BUILDING_FROM_SOURCE.md#use-lld-for-the-linker
           # provides lld
           pkgs.lld_18
@@ -132,10 +137,11 @@
           NIX_GLIBC_PATH =
             if pkgs.stdenv.isLinux then "${pkgs.glibc.out}/lib" else "";
 
-          LD_LIBRARY_PATH = with pkgs;
+          LD_LIBRARY_PATH =  with pkgs;
             lib.makeLibraryPath
               ([ pkg-config stdenv.cc.cc.lib libffi ncurses zlib ]
               ++ linuxDevInputs);
+
           NIXPKGS_ALLOW_UNFREE =
             1; # to run the GUI examples with NVIDIA's closed source drivers
 
