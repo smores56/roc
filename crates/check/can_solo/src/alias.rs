@@ -4,6 +4,56 @@ use roc_module::{ident::Lowercase, symbol::Symbol};
 use roc_region::all::{Loc, Region};
 use roc_types::{subs::Variable, types::Type};
 
+use crate::pattern::Pattern;
+
+enum ModuleFunctionConstraint<'a> {
+    /// A method exposed by the custom type of the given module.
+    ///
+    /// It must be a function of the specified name that takes said custom type
+    /// as the first of one or more arguments and return the specified type.
+    ///
+    /// e.g. `where a.decode(List U8) -> Something`
+    Method {
+        name: Lowercase,
+        args: Vec<'a, Pattern<'a>>,
+        // args
+    },
+    /// A function defined on any module's custom type that returns
+    /// the desired module's custom type.
+    ///
+    /// It must be a function of the specified name that takes the given argument
+    /// types and returns some type with one type variable of the desired module's
+    /// custom type.
+    ///
+    /// e.g. `where *.decode : List U8 -> a`
+    AnyReturning {
+        name: Lowercase,
+        args: Vec<'a, Pattern<'a>>,
+        returning: Type,
+    },
+}
+
+struct ModuleFunction {
+    pub name: Lowercase,
+    pub type_: Type,
+}
+
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AliasMethod {
     Generated {
@@ -21,6 +71,7 @@ pub enum AliasMethod {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GeneratedAliasMethod {
     Equals,
+    ToStr,
     ToHash,
     Encode,
     Decode,
@@ -30,8 +81,7 @@ pub enum GeneratedAliasMethod {
 pub struct AliasVar<'a> {
     pub name: Lowercase,
     pub var: Variable,
-    // TODO: should this be in an Option to avoid the allocation?
-    pub methods: ArenaVecMap<'a, Lowercase, Type>,
+    pub opt_methods: Option<ArenaVecMap<'a, Lowercase, Type>>,
 }
 
 impl<'a> AliasVar<'a> {
@@ -39,7 +89,7 @@ impl<'a> AliasVar<'a> {
         Self {
             name,
             var,
-            methods: ArenaVecMap::new_in(arena),
+            opt_methods: None,
         }
     }
 }

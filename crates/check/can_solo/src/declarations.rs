@@ -3,12 +3,16 @@ use bumpalo::Bump;
 use roc_collections::{soa::index_push_new, ArenaVecMap};
 use roc_module::symbol::{IdentId, Symbol};
 use roc_region::all::{Loc, Region};
-use roc_types::subs::{IllegalCycleMark, Variable};
+use roc_types::{
+    subs::{IllegalCycleMark, Variable},
+    types::EarlyReturnKind,
+};
+use soa::Index;
 
 use crate::{
     annotation::Annotation,
     def::Def,
-    expr::{ClosureData, Expr, Recursive},
+    expr::{AnnotatedMark, ClosureData, Expr, Recursive},
     pattern::Pattern,
 };
 
@@ -20,15 +24,9 @@ pub struct Declarations<'a> {
     /// same lengths as declarations; has a dummy value if not applicable
     pub variables: Vec<'a, Variable>,
     pub symbols: Vec<'a, Loc<Symbol>>,
-    pub annotations: Vec<'a, Option<crate::def::Annotation>>,
+    pub annotations: Vec<'a, Option<crate::def::Annotation<'a>>>,
 
-    // used for ability member specializatons.
-    pub specializes: ArenaVecMap<'a, usize, Symbol>,
-
-    // used while lowering params.
-    arity_by_name: ArenaVecMap<'a, IdentId, usize>,
-
-    pub host_exposed_annotations: ArenaVecMap<'a, usize, (Variable, crate::def::Annotation)>,
+    pub host_exposed_annotations: ArenaVecMap<'a, usize, (Variable, crate::def::Annotation<'a>)>,
 
     pub function_bodies: Vec<'a, Loc<FunctionDef>>,
     pub expressions: Vec<'a, Loc<Expr<'a>>>,
@@ -50,9 +48,7 @@ impl<'a> Declarations<'a> {
             host_exposed_annotations: ArenaVecMap::new_in(arena),
             function_bodies: Vec::with_capacity_in(capacity, arena),
             expressions: Vec::with_capacity_in(capacity, arena),
-            specializes: ArenaVecMap::new_in(arena), // number of specializations is probably low
-            destructs: Vec::new_in(arena),           // number of destructs is probably low
-            arity_by_name: ArenaVecMap::with_capacity_in(capacity, arena),
+            destructs: Vec::new_in(arena), // number of destructs is probably low
         }
     }
 
@@ -85,16 +81,11 @@ impl<'a> Declarations<'a> {
         let index = self.declarations.len();
 
         let function_def = FunctionDef {
-            closure_type: loc_closure_data.value.closure_type,
             return_type: loc_closure_data.value.return_type,
             fx_type: loc_closure_data.value.fx_type,
             early_returns: loc_closure_data.value.early_returns,
-            captured_symbols: loc_closure_data.value.captured_symbols,
             arguments: loc_closure_data.value.arguments,
         };
-
-        self.arity_by_name
-            .insert(symbol.value.ident_id(), function_def.arguments.len());
 
         let loc_function_def = Loc::at(loc_closure_data.region, function_def);
 
@@ -138,16 +129,11 @@ impl<'a> Declarations<'a> {
         let index = self.declarations.len();
 
         let function_def = FunctionDef {
-            closure_type: loc_closure_data.value.closure_type,
             return_type: loc_closure_data.value.return_type,
             fx_type: loc_closure_data.value.fx_type,
             early_returns: loc_closure_data.value.early_returns,
-            captured_symbols: loc_closure_data.value.captured_symbols,
             arguments: loc_closure_data.value.arguments,
         };
-
-        self.arity_by_name
-            .insert(symbol.value.ident_id(), function_def.arguments.len());
 
         let loc_function_def = Loc::at(loc_closure_data.region, function_def);
 
@@ -302,11 +288,9 @@ impl<'a> Declarations<'a> {
         match def.loc_expr.value {
             Expr::Closure(closure_data) => {
                 let function_def = FunctionDef {
-                    closure_type: closure_data.closure_type,
                     return_type: closure_data.return_type,
                     fx_type: closure_data.fx_type,
                     early_returns: closure_data.early_returns,
-                    captured_symbols: closure_data.captured_symbols,
                     arguments: closure_data.arguments,
                 };
 
@@ -325,64 +309,6 @@ impl<'a> Declarations<'a> {
                 self.variables[index] = def.expr_var;
             }
         }
-    }
-
-    /// Convert a value def to a function def with the given arguments
-    /// Currently used in lower_params
-    pub fn convert_value_to_function(
-        &mut self,
-        index: usize,
-        new_arguments: Vec<(Variable, AnnotatedMark, Loc<Pattern>)>,
-        var_store: &mut VarStore,
-    ) {
-        match self.declarations[index] {
-            DeclarationTag::Value => {
-                let new_args_len = new_arguments.len();
-
-                let loc_body = self.expressions[index].clone();
-                let region = loc_body.region;
-
-                let closure_data = ClosureData {
-                    function_type: var_store.fresh(),
-                    closure_type: var_store.fresh(),
-                    return_type: var_store.fresh(),
-                    fx_type: var_store.fresh(),
-                    early_returns: vec![],
-                    name: self.symbols[index].value,
-                    captured_symbols: vec![],
-                    recursive: Recursive::NotRecursive,
-                    arguments: new_arguments,
-                    loc_body: Box::new(loc_body),
-                };
-
-                let loc_closure_data = Loc::at(region, closure_data);
-
-                let function_def = FunctionDef {
-                    closure_type: loc_closure_data.value.closure_type,
-                    return_type: loc_closure_data.value.return_type,
-                    fx_type: loc_closure_data.value.fx_type,
-                    early_returns: loc_closure_data.value.early_returns,
-                    captured_symbols: loc_closure_data.value.captured_symbols,
-                    arguments: loc_closure_data.value.arguments,
-                };
-
-                let loc_function_def = Loc::at(region, function_def);
-
-                let function_def_index =
-                    index_push_new(&mut self.function_bodies, loc_function_def);
-
-                if let Some(annotation) = &mut self.annotations[index] {
-                    annotation.convert_to_fn(new_args_len, var_store);
-                }
-
-                if let Some((_var, annotation)) = self.host_exposed_annotations.get_mut(&index) {
-                    annotation.convert_to_fn(new_args_len, var_store);
-                }
-
-                self.declarations[index] = DeclarationTag::Function(function_def_index);
-            }
-            _ => internal_error!("Expected value declaration"),
-        };
     }
 
     pub fn len(&self) -> usize {
@@ -448,30 +374,26 @@ impl<'a> Declarations<'a> {
 
         collector
     }
-
-    pub(crate) fn take_arity_by_name(&mut self) -> VecMap<IdentId, usize> {
-        // `arity_by_name` is only needed for lowering module params
-        std::mem::take(&mut self.arity_by_name)
-    }
 }
 
 roc_error_macros::assert_sizeof_default!(DeclarationTag, 8);
 
 #[derive(Clone, Copy, Debug)]
-pub enum DeclarationTag {
+pub enum DeclarationTag<'a> {
     Value,
     Expectation,
-    Function(Index<Loc<FunctionDef>>),
-    Recursive(Index<Loc<FunctionDef>>),
-    TailRecursive(Index<Loc<FunctionDef>>),
-    Destructure(Index<DestructureDef>),
+    Function(Index<Loc<FunctionDef<'a>>>),
+    // TODO: do we need recursion tracking?
+    Recursive(Index<Loc<FunctionDef<'a>>>),
+    TailRecursive(Index<Loc<FunctionDef<'a>>>),
+    Destructure(Index<DestructureDef<'a>>),
     MutualRecursion {
         length: u16,
         cycle_mark: IllegalCycleMark,
     },
 }
 
-impl DeclarationTag {
+impl<'a> DeclarationTag<'a> {
     fn len(self) -> usize {
         use DeclarationTag::*;
 
@@ -486,17 +408,15 @@ impl DeclarationTag {
 }
 
 #[derive(Clone, Debug)]
-pub struct FunctionDef {
-    pub closure_type: Variable,
+pub struct FunctionDef<'a> {
     pub return_type: Variable,
     pub fx_type: Variable,
-    pub early_returns: Vec<(Variable, Region, EarlyReturnKind)>,
-    pub captured_symbols: Vec<(Symbol, Variable)>,
-    pub arguments: Vec<(Variable, AnnotatedMark, Loc<Pattern>)>,
+    pub early_returns: Vec<'a, (Variable, Region, EarlyReturnKind)>,
+    pub arguments: Vec<'a, (Variable, AnnotatedMark, Loc<Pattern<'a>>)>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DestructureDef {
-    pub loc_pattern: Loc<Pattern>,
-    pub pattern_vars: VecMap<Symbol, Variable>,
+pub struct DestructureDef<'a> {
+    pub loc_pattern: Loc<Pattern<'a>>,
+    pub pattern_vars: ArenaVecMap<'a, Symbol, Variable>,
 }

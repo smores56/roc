@@ -1,4 +1,3 @@
-use crate::annotation::freshen_opaque_def;
 use crate::env::Env;
 use crate::expr::{canonicalize_expr, Expr, IntValue, Output};
 use crate::num::{
@@ -12,11 +11,14 @@ use roc_module::ident::{Ident, Lowercase, TagName};
 use roc_module::symbol::Symbol;
 use roc_parse::ast::{self, ExtractSpaces, StrLiteral, StrSegment};
 use roc_parse::pattern::PatternType;
-use roc_problem::can::{MalformedPatternProblem, Problem, RuntimeError, ShadowKind};
+use roc_problem::can::{
+    CompilerProblem, DeprecatedSyntaxKind, MalformedPatternProblem, Problem, RuntimeError,
+    ShadowKind,
+};
 use roc_region::all::{Loc, Region};
 use roc_types::num::SingleQuoteBound;
 use roc_types::subs::{VarStore, Variable};
-use roc_types::types::{OptAbleVar, PatternCategory, Type};
+use roc_types::types::PatternCategory;
 
 /// A pattern, including possible problems (e.g. shadowing) so that
 /// codegen can generate a runtime error if this pattern is reached.
@@ -33,28 +35,12 @@ pub enum Pattern<'a> {
         tag_name: TagName,
         arguments: &'a [(Variable, Loc<Pattern<'a>>)],
     },
-    UnwrappedOpaque {
+    AppliedCustomTag {
         whole_var: Variable,
-        opaque: Symbol,
-        argument: &'a (Variable, Loc<Pattern<'a>>),
-
-        // The following help us link this opaque reference to the type specified by its
-        // definition, which we then use during constraint generation. For example
-        // suppose we have
-        //
-        //   Id n := [Id U64 n]
-        //   strToBool : Str -> Bool
-        //
-        //   f = \@Id who -> strToBool who
-        //
-        // Then `opaque` is "Id", `argument` is "who", but this is not enough for us to
-        // infer the type of the expression as "Id Str" - we need to link the specialized type of
-        // the variable "n".
-        // That's what `specialized_def_type` and `type_arguments` are for; they are specialized
-        // for the expression from the opaque definition. `type_arguments` is something like
-        // [(n, fresh1)], and `specialized_def_type` becomes "[Id U64 fresh1]".
-        specialized_def_type: &'a Type,
-        type_arguments: &'a [OptAbleVar],
+        ext_var: Variable,
+        custom_type_symbol: Symbol,
+        tag_name: TagName,
+        arguments: &'a [(Variable, Loc<Pattern<'a>>)],
     },
     RecordDestructure {
         whole_var: Variable,
@@ -102,17 +88,6 @@ pub enum Pattern<'a> {
     },
     Underscore,
 
-    /// An identifier that marks a specialization of an ability member.
-    /// For example, given an ability member definition `hash : a -> U64 where a implements Hash`,
-    /// there may be the specialization `hash : Bool -> U64`. In this case we generate a
-    /// new symbol for the specialized "hash" identifier.
-    AbilityMemberSpecialization {
-        /// The symbol for this specialization.
-        ident: Symbol,
-        /// The ability name being specialized.
-        specializes: Symbol,
-    },
-
     // Runtime Exceptions
     Shadowed {
         original_region: Region,
@@ -134,7 +109,7 @@ impl<'a> Pattern<'a> {
             As { subpattern, .. } => subpattern.value.opt_var(),
 
             AppliedTag { whole_var, .. } => Some(*whole_var),
-            UnwrappedOpaque { whole_var, .. } => Some(*whole_var),
+            AppliedCustomTag { whole_var, .. } => Some(*whole_var),
             RecordDestructure { whole_var, .. } => Some(*whole_var),
             TupleDestructure { whole_var, .. } => Some(*whole_var),
             List {
@@ -147,8 +122,6 @@ impl<'a> Pattern<'a> {
             StrLiteral(_) => None,
             SingleQuote { .. } => None,
             Underscore => None,
-
-            AbilityMemberSpecialization { .. } => None,
 
             Shadowed { .. }
             | OpaqueNotInScope(..)
@@ -166,8 +139,7 @@ impl<'a> Pattern<'a> {
             | Shadowed { .. }
             | OpaqueNotInScope(..)
             | UnsupportedPattern(..)
-            | MalformedPattern(..)
-            | AbilityMemberSpecialization { .. } => true,
+            | MalformedPattern(..) => true,
 
             RecordDestructure { destructs, .. } => {
                 // If all destructs are surely exhaustive, then this is surely exhaustive.
@@ -189,17 +161,13 @@ impl<'a> Pattern<'a> {
             } => subpattern.value.surely_exhaustive(),
             List { patterns, .. } => patterns.surely_exhaustive(),
             AppliedTag { .. }
+            // TODO: is this actually surely exhaustive?
+            | AppliedCustomTag { .. }
             | NumLiteral { .. }
             | IntLiteral { .. }
             | FloatLiteral { .. }
             | StrLiteral(_)
             | SingleQuote { .. } => false,
-            UnwrappedOpaque { argument, .. } => {
-                // Opaques can only match against one constructor (the opaque symbol), so this is
-                // surely exhaustive against T if the inner pattern is surely exhaustive against
-                // its type U.
-                argument.1.value.surely_exhaustive()
-            }
         }
     }
 
@@ -212,7 +180,7 @@ impl<'a> Pattern<'a> {
             As { subpattern, .. } => subpattern.value.category(),
 
             AppliedTag { tag_name, .. } => C::Ctor(tag_name.clone()),
-            UnwrappedOpaque { opaque, .. } => C::Opaque(*opaque),
+            AppliedCustomTag { tag_name, .. } => C::Ctor(tag_name.clone()),
             RecordDestructure { destructs, .. } if destructs.is_empty() => C::EmptyRecord,
             RecordDestructure { .. } => C::Record,
             TupleDestructure { .. } => C::Tuple,
@@ -223,8 +191,6 @@ impl<'a> Pattern<'a> {
             StrLiteral(_) => C::Str,
             SingleQuote { .. } => C::Character,
             Underscore => C::PatternDefault,
-
-            AbilityMemberSpecialization { .. } => C::PatternDefault,
 
             Shadowed { .. }
             | OpaqueNotInScope(..)
@@ -292,7 +258,6 @@ pub fn canonicalize_def_header_pattern<'a, 'b>(
     env: &mut Env<'a, 'b>,
     var_store: &mut VarStore,
     scope: &mut Scope,
-    pending_abilities_in_scope: &PendingAbilitiesInScope,
     output: &mut Output,
     pattern_type: PatternType,
     pattern: &ast::Pattern<'a>,
@@ -303,11 +268,7 @@ pub fn canonicalize_def_header_pattern<'a, 'b>(
     match pattern {
         // Identifiers that shadow ability members may appear (and may only appear) at the header of a def.
         Identifier { ident: name } => {
-            match scope.introduce_or_shadow_ability_member(
-                pending_abilities_in_scope,
-                (*name).into(),
-                region,
-            ) {
+            match scope.introduce_str((*name).into(), region) {
                 Ok((symbol, shadowing_ability_member)) => {
                     if name.contains("__") {
                         env.problem(Problem::RuntimeError(RuntimeError::MalformedPattern(
@@ -440,14 +401,19 @@ pub fn canonicalize_pattern<'a, 'b>(
             }
         }
         OpaqueRef(name) => {
-            // If this opaque ref had an argument, we would be in the "Apply" branch.
-            let loc_name = Loc::at(region, (*name).into());
-            env.problem(Problem::RuntimeError(RuntimeError::OpaqueNotApplied(
-                loc_name,
-            )));
+            let compiler_problem =
+                CompilerProblem::DeprecatedSyntax(DeprecatedSyntaxKind::OpaqueRef);
+            env.problems
+                .push(Problem::RuntimeError(RuntimeError::CompilerProblem(
+                    compiler_problem,
+                    region,
+                )));
+
             Pattern::UnsupportedPattern(region)
         }
         Apply(tag, patterns) => {
+            // TODO: check for imported custom type variants in scope before treating as a normal tag.
+
             let mut can_patterns = Vec::with_capacity_in(patterns.len(), env.arena);
             for loc_pattern in *patterns {
                 let can_pattern = canonicalize_pattern(
@@ -465,6 +431,7 @@ pub fn canonicalize_pattern<'a, 'b>(
             }
 
             match tag.value {
+                // TODO: handle custom tag variants
                 Tag(name) => {
                     let tag_name = TagName(name.into());
                     Pattern::AppliedTag {
@@ -474,43 +441,18 @@ pub fn canonicalize_pattern<'a, 'b>(
                         arguments: can_patterns.into_bump_slice(),
                     }
                 }
+                OpaqueRef(_name) => {
+                    let compiler_problem =
+                        CompilerProblem::DeprecatedSyntax(DeprecatedSyntaxKind::OpaqueRef);
+                    env.problems
+                        .push(Problem::RuntimeError(RuntimeError::CompilerProblem(
+                            compiler_problem,
+                            region,
+                        )));
 
-                OpaqueRef(name) => match scope.lookup_opaque_ref(name, tag.region) {
-                    Ok((opaque, opaque_def)) => {
-                        debug_assert!(!can_patterns.is_empty());
+                    Pattern::UnsupportedPattern(region)
+                }
 
-                        if can_patterns.len() > 1 {
-                            env.problem(Problem::RuntimeError(
-                                RuntimeError::OpaqueAppliedToMultipleArgs(region),
-                            ));
-
-                            Pattern::UnsupportedPattern(region)
-                        } else {
-                            let argument = env.arena.alloc(can_patterns.pop().unwrap());
-
-                            let (type_arguments, lambda_set_variables, specialized_def_type) =
-                                freshen_opaque_def(var_store, opaque_def);
-
-                            output.references.insert_type_lookup(
-                                opaque,
-                                crate::procedure::QualifiedReference::Unqualified,
-                            );
-
-                            Pattern::UnwrappedOpaque {
-                                whole_var: var_store.fresh(),
-                                opaque,
-                                argument,
-                                specialized_def_type: env.arena.alloc(specialized_def_type),
-                                type_arguments,
-                            }
-                        }
-                    }
-                    Err(runtime_error) => {
-                        env.problem(Problem::RuntimeError(runtime_error));
-
-                        Pattern::OpaqueNotInScope(Loc::at(tag.region, name.into()))
-                    }
-                },
                 _ => {
                     env.problem(Problem::RuntimeError(RuntimeError::MalformedPattern(
                         MalformedPatternProblem::CantApplyPattern,
@@ -1045,11 +987,7 @@ impl<'a> BindingsFromPattern<'a> {
                     use BindingsFromPatternWork::*;
 
                     match &loc_pattern.value {
-                        Identifier(symbol)
-                        | AbilityMemberSpecialization {
-                            ident: symbol,
-                            specializes: _,
-                        } => {
+                        Identifier(symbol) => {
                             return Some((*symbol, loc_pattern.region));
                         }
                         As { subpattern, symbol } => {
@@ -1059,13 +997,13 @@ impl<'a> BindingsFromPattern<'a> {
                         AppliedTag {
                             arguments: loc_args,
                             ..
+                        }
+                        | AppliedCustomTag {
+                            arguments: loc_args,
+                            ..
                         } => {
                             let it = loc_args.iter().rev().map(|(_, p)| Pattern(p));
                             stack.extend(it);
-                        }
-                        UnwrappedOpaque { argument, .. } => {
-                            let (_, loc_arg) = &**argument;
-                            stack.push(Pattern(loc_arg));
                         }
                         TupleDestructure { destructs, .. } => {
                             let it = destructs.iter().rev().map(TupleDestruct);
@@ -1125,11 +1063,7 @@ impl<'a> Iterator for BindingsFromPattern<'a> {
         match self {
             BindingsFromPattern::Empty => None,
             BindingsFromPattern::One(loc_pattern) => match &loc_pattern.value {
-                Identifier(symbol)
-                | AbilityMemberSpecialization {
-                    ident: symbol,
-                    specializes: _,
-                } => {
+                Identifier(symbol) => {
                     let region = loc_pattern.region;
                     *self = Self::Empty;
                     Some((*symbol, region))

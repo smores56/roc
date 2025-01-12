@@ -1,4 +1,3 @@
-use crate::scope::SymbolLookup;
 use bumpalo::{collections::Vec, Bump};
 use roc_module::symbol::{ModuleId, Symbol};
 
@@ -92,18 +91,8 @@ impl<'a> References<'a> {
         }
     }
 
-    pub fn insert_value_lookup(&mut self, lookup: SymbolLookup, qualified: QualifiedReference) {
-        self.insert(
-            lookup.symbol,
-            qualified.flags(ReferencesBitflags::VALUE_LOOKUP),
-        );
-
-        if let Some((_, params_symbol)) = lookup.module_params {
-            self.insert(
-                params_symbol,
-                qualified.flags(ReferencesBitflags::VALUE_LOOKUP),
-            );
-        }
+    pub fn insert_value_lookup(&mut self, symbol: Symbol, qualified: QualifiedReference) {
+        self.insert(symbol, qualified.flags(ReferencesBitflags::VALUE_LOOKUP));
     }
 
     pub fn insert_type_lookup(&mut self, symbol: Symbol, qualified: QualifiedReference) {

@@ -1,7 +1,7 @@
-use crate::alias::Alias;
+use crate::alias::{Alias, AliasKind, AliasMethod, AliasVar};
 use crate::env::Env;
 use crate::procedure::{QualifiedReference, References};
-use crate::scope::{Scope, SymbolLookup};
+use crate::scope::Scope;
 use bumpalo::collections::Vec;
 use bumpalo::{vec, Bump};
 use roc_collections::{ArenaVecMap, ArenaVecSet};
@@ -14,8 +14,8 @@ use roc_problem::can::{Problem, ShadowKind};
 use roc_region::all::{Loc, Region};
 use roc_types::subs::{VarStore, Variable};
 use roc_types::types::{
-    name_type_var, AbilitySet, ExtImplicitOpenness, OptAbleType, OptAbleVar, RecordField, Type,
-    TypeExtension,
+    name_type_var, AbilitySet, AliasCommon, ExtImplicitOpenness, OptAbleType, OptAbleVar,
+    RecordField, Type, TypeExtension,
 };
 
 #[derive(Clone, Debug)]
@@ -46,72 +46,72 @@ impl<'a> Annotation<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum NamedOrAbleVariable<'a> {
+pub enum NamedOrWithMethodsVariable<'a> {
     Named(&'a NamedVariable),
-    Able(&'a AbleVariable),
+    WithMethods(&'a VariableWithMethods<'a>),
 }
 
-impl<'a> NamedOrAbleVariable<'a> {
+impl<'a> NamedOrWithMethodsVariable<'a> {
     pub fn first_seen(&self) -> Region {
         match self {
-            NamedOrAbleVariable::Named(nv) => nv.first_seen,
-            NamedOrAbleVariable::Able(av) => av.first_seen,
+            NamedOrWithMethodsVariable::Named(nv) => nv.first_seen,
+            NamedOrWithMethodsVariable::WithMethods(wm) => wm.first_seen,
         }
     }
 
     pub fn name(&self) -> &Lowercase {
         match self {
-            NamedOrAbleVariable::Named(nv) => &nv.name,
-            NamedOrAbleVariable::Able(av) => &av.name,
+            NamedOrWithMethodsVariable::Named(nv) => &nv.name,
+            NamedOrWithMethodsVariable::WithMethods(wm) => &wm.name,
         }
     }
 
     pub fn variable(&self) -> Variable {
         match self {
-            NamedOrAbleVariable::Named(nv) => nv.variable,
-            NamedOrAbleVariable::Able(av) => av.variable,
+            NamedOrWithMethodsVariable::Named(nv) => nv.variable,
+            NamedOrWithMethodsVariable::WithMethods(wm) => wm.variable,
         }
     }
 }
 
-pub enum OwnedNamedOrAble {
+pub enum OwnedNamedOrWithMethods<'a> {
     Named(NamedVariable),
-    Able(AbleVariable),
+    WithMethods(NamedOrWithMethodsVariable<'a>),
 }
 
-impl OwnedNamedOrAble {
+impl<'a> OwnedNamedOrWithMethods<'a> {
     pub fn first_seen(&self) -> Region {
         match self {
-            OwnedNamedOrAble::Named(nv) => nv.first_seen,
-            OwnedNamedOrAble::Able(av) => av.first_seen,
+            OwnedNamedOrWithMethods::Named(nv) => nv.first_seen,
+            OwnedNamedOrWithMethods::WithMethods(wm) => wm.first_seen,
         }
     }
 
     pub fn ref_name(&self) -> &Lowercase {
         match self {
-            OwnedNamedOrAble::Named(nv) => &nv.name,
-            OwnedNamedOrAble::Able(av) => &av.name,
+            NamedOrWithMethodsVariable::Named(nv) => &nv.name,
+            NamedOrWithMethodsVariable::WithMethods(wm) => &wm.name,
         }
     }
 
     pub fn name(self) -> Lowercase {
         match self {
-            OwnedNamedOrAble::Named(nv) => nv.name,
-            OwnedNamedOrAble::Able(av) => av.name,
+            NamedOrWithMethodsVariable::Named(nv) => nv.name,
+            NamedOrWithMethodsVariable::WithMethods(wm) => wm.name,
         }
     }
 
     pub fn variable(&self) -> Variable {
         match self {
-            OwnedNamedOrAble::Named(nv) => nv.variable,
-            OwnedNamedOrAble::Able(av) => av.variable,
+            NamedOrWithMethodsVariable::Named(nv) => nv.variable,
+            NamedOrWithMethodsVariable::WithMethods(wm) => wm.variable,
         }
     }
 
-    pub fn opt_abilities(&self) -> Option<&AbilitySet> {
+    pub fn opt_methods(&self) -> Option<&AbilitySet> {
         match self {
-            OwnedNamedOrAble::Named(_) => None,
-            OwnedNamedOrAble::Able(av) => Some(&av.abilities),
+            NamedOrWithMethodsVariable::Named(_) => None,
+            NamedOrWithMethodsVariable::WithMethods(wm) => Some(&wm.methods),
         }
     }
 }
@@ -127,34 +127,32 @@ pub struct NamedVariable {
 
 /// A type variable bound to an ability, like "a implements Hash".
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct AbleVariable {
+pub struct VariableWithMethods<'a> {
     pub variable: Variable,
     pub name: Lowercase,
-    pub abilities: AbilitySet,
+    pub methods: Vec<'a, AliasMethod>,
     // NB: there may be multiple occurrences of a variable
     pub first_seen: Region,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IntroducedVariables<'a> {
-    pub wildcards: Vec<'a, Loc<Variable>>,
     /// Explicit inference variables, i.e. `_`
     pub inferred: Vec<'a, Loc<Variable>>,
     /// Named type variables
     pub named: ArenaVecSet<'a, NamedVariable>,
-    /// Named type variables bound to an ability
-    pub able: ArenaVecSet<'a, AbleVariable>,
-    /// Extension variables which should be inferred in output position.
+    /// Named type variables with sets of methods
+    pub with_methods: ArenaVecSet<'a, VariableWithMethods<'a>>,
+    /// Extension variables which should be inferred in output position
     pub infer_ext_in_output: Vec<'a, Variable>,
 }
 
 impl<'a> IntroducedVariables<'a> {
     #[inline(always)]
     fn debug_assert_not_already_present(&self, var: Variable) {
-        debug_assert!((self.wildcards.iter().map(|v| &v.value))
-            .chain(self.inferred.iter().map(|v| &v.value))
+        debug_assert!((self.inferred.iter().map(|v| &v.value))
             .chain(self.named.iter().map(|nv| &nv.variable))
-            .chain(self.able.iter().map(|av| &av.variable))
+            .chain(self.with_methods.iter().map(|wm| &wm.variable))
             .chain(self.infer_ext_in_output.iter())
             .all(|&v| v != var));
     }
@@ -171,22 +169,22 @@ impl<'a> IntroducedVariables<'a> {
         self.named.insert(named_variable);
     }
 
-    pub fn insert_able(&mut self, name: Lowercase, var: Loc<Variable>, abilities: AbilitySet) {
+    pub fn insert_with_methods(
+        &mut self,
+        name: Lowercase,
+        var: Loc<Variable>,
+        methods: Vec<'a, AliasMethod>,
+    ) {
         self.debug_assert_not_already_present(var.value);
 
-        let able_variable = AbleVariable {
+        let able_variable = VariableWithMethods {
             name,
-            abilities,
+            methods,
             variable: var.value,
             first_seen: var.region,
         };
 
         self.able.insert(able_variable);
-    }
-
-    pub fn insert_wildcard(&mut self, var: Loc<Variable>) {
-        self.debug_assert_not_already_present(var.value);
-        self.wildcards.push(var);
     }
 
     pub fn insert_inferred(&mut self, var: Loc<Variable>) {
@@ -225,12 +223,15 @@ impl<'a> IntroducedVariables<'a> {
             .map(|(_, var)| var)
     }
 
-    pub fn iter_named(&self) -> impl Iterator<Item = NamedOrAbleVariable> {
-        (self.named.iter().map(NamedOrAbleVariable::Named))
-            .chain(self.able.iter().map(NamedOrAbleVariable::Able))
+    pub fn iter_named(&self) -> impl Iterator<Item = NamedOrWithMethodsVariable> {
+        (self.named.iter().map(NamedOrWithMethodsVariable::Named)).chain(
+            self.able
+                .iter()
+                .map(NamedOrWithMethodsVariable::WithMethods),
+        )
     }
 
-    pub fn named_var_by_name(&self, name: &Lowercase) -> Option<NamedOrAbleVariable> {
+    pub fn named_var_by_name(&self, name: &Lowercase) -> Option<NamedOrWithMethodsVariable> {
         self.iter_named().find(|v| v.name() == name)
     }
 
@@ -372,10 +373,7 @@ pub(crate) fn make_apply_symbol(
         // Look it up in scope!
 
         match scope.lookup_str(ident, region) {
-            Ok(SymbolLookup {
-                symbol,
-                module_params: _,
-            }) => {
+            Ok(symbol) => {
                 references.insert_type_lookup(symbol, QualifiedReference::Unqualified);
                 Ok(symbol)
             }
@@ -387,10 +385,7 @@ pub(crate) fn make_apply_symbol(
         }
     } else {
         match env.qualified_lookup(scope, module_name, ident, region) {
-            Ok(SymbolLookup {
-                symbol,
-                module_params: _,
-            }) => {
+            Ok(symbol) => {
                 references.insert_type_lookup(symbol, QualifiedReference::Qualified);
                 Ok(symbol)
             }
@@ -741,7 +736,7 @@ fn can_annotation_help<'a, 'b>(
                 references,
             );
             let mut vars = Vec::with_capacity(loc_vars.len());
-            let mut lowercase_vars: Vec<Loc<AliasVar>> = Vec::with_capacity(loc_vars.len());
+            let mut lowercase_vars: Vec<Loc<AliasVar<'a>>> = Vec::with_capacity(loc_vars.len());
 
             references.insert_type_lookup(symbol, QualifiedReference::Unqualified);
 
@@ -764,7 +759,7 @@ fn can_annotation_help<'a, 'b>(
                         AliasVar {
                             name: var_name,
                             var,
-                            opt_bound_abilities: None,
+                            opt_methods: Some(ArenaVecMap::new_in(env.arena)),
                         },
                     ));
                 } else {
@@ -779,7 +774,7 @@ fn can_annotation_help<'a, 'b>(
                         AliasVar {
                             name: var_name,
                             var,
-                            opt_bound_abilities: None,
+                            opt_methods: Some(ArenaVecMap::new_in(env.arena)),
                         },
                     ));
                 }
@@ -826,7 +821,7 @@ fn can_annotation_help<'a, 'b>(
                 inner_type
             };
 
-            let mut hidden_variables = MutSet::default();
+            let mut hidden_variables = ArenaVecMap::new_in(env.arena);
             hidden_variables.extend(alias_actual.variables());
 
             for loc_var in lowercase_vars.iter() {
@@ -834,7 +829,7 @@ fn can_annotation_help<'a, 'b>(
             }
 
             // TODO: handle implicit ext variables in `as` aliases
-            let infer_ext_in_output = vec![];
+            let infer_ext_in_output = Vec::new_in(env.arena);
 
             {
                 let roc_types::types::VariableDetail {
@@ -864,7 +859,7 @@ fn can_annotation_help<'a, 'b>(
                 lowercase_vars,
                 infer_ext_in_output,
                 alias_actual,
-                AliasKind::Structural, // aliases in "as" are never opaque
+                AliasKind::Structural, // aliases in "as" are never for custom types
             );
 
             let alias = scope.lookup_alias(symbol).unwrap();
@@ -1504,17 +1499,17 @@ fn can_assigned_tuple_elems(
 
 // TODO trim down these arguments!
 #[allow(clippy::too_many_arguments)]
-fn can_tags<'a>(
-    env: &mut Env,
+fn can_tags<'a, 's, 'b>(
+    env: &mut Env<'a, 'b>,
     pol: CanPolarity,
     tags: &'a [Loc<Tag<'a>>],
     region: Region,
-    scope: &mut Scope,
+    scope: &mut Scope<'a, 's>,
     var_store: &mut VarStore,
-    introduced_variables: &mut IntroducedVariables,
-    local_aliases: &mut VecMap<Symbol, Alias>,
+    introduced_variables: &mut IntroducedVariables<'a>,
+    local_aliases: &mut ArenaVecMap<'a, Symbol, Alias>,
     references: &mut References,
-) -> Vec<(TagName, Vec<Type>)> {
+) -> Vec<'a, (TagName, Vec<'a, Type>)> {
     let mut tag_types = Vec::with_capacity(tags.len());
 
     // tag names we've seen so far in this tag union

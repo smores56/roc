@@ -2377,6 +2377,7 @@ fn canonicalize_pending_value_def<'a>(
                 DefKind::Let,
             )
         }
+
         Body(loc_can_pattern, loc_expr) => {
             //
             let def_kind = DefKind::from_pattern(var_store, &loc_can_pattern);
@@ -2452,14 +2453,15 @@ fn canonicalize_pending_value_def<'a>(
                 def,
             }
         }
+
         IngestedFile(loc_pattern, opt_loc_ann, path_literal) => {
             let relative_path =
                 if let ast::StrLiteral::PlainLine(ingested_path) = path_literal.value {
                     ingested_path
                 } else {
                     todo!(
-                    "Only plain strings are supported. Other cases should be made impossible here"
-                );
+                        "Only plain strings are supported. Other cases should be made impossible here"
+                    );
                 };
 
             let mut file_path: PathBuf = env.module_path.into();

@@ -1789,12 +1789,12 @@ fn canonicalize_closure_body<'a>(
     for (sub_symbol, region) in bound_by_argument_patterns {
         if !output.references.has_value_lookup(sub_symbol) {
             // The body never referenced this argument we declared. It's an unused argument!
-            env.problem(Problem::UnusedArgument(
-                symbol,
+            env.problem(Problem::UnusedArgument {
+                function_symbol: symbol,
                 is_anonymous,
-                sub_symbol,
-                region,
-            ));
+                arg_symbol: sub_symbol,
+                arg_region: region,
+            });
         } else {
             // We shouldn't ultimately count arguments as referenced locals. Otherwise,
             // we end up with weird conclusions like the expression (\x -> x + 1)

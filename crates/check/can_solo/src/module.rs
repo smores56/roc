@@ -2,11 +2,12 @@ use std::path::Path;
 
 use crate::alias::{Alias, AliasMethod};
 use crate::annotation::{canonicalize_annotation, AnnotationFor};
+use crate::declarations::{DeclarationTag, Declarations};
 use crate::def::{canonicalize_defs, report_unused_imports, sort_top_level_can_defs, Def, DefKind};
 use crate::env::Env;
-use crate::expr::Declarations;
+use crate::expr::{ExpectLookup, Expr, Output};
 use crate::ident_ids::IdentIds;
-use crate::pattern::{Pattern, RecordDestruct};
+use crate::pattern::{BindingsFromPattern, Pattern};
 use crate::procedure::References;
 use crate::scope::Scope;
 
@@ -143,39 +144,12 @@ pub struct Module<'a> {
     pub rigid_variables: RigidVariables<'a>,
     pub loc_expects: ArenaVecMap<'a, Region, Vec<'a, ExpectLookup>>,
     pub has_dbgs: bool,
-    pub module_params: Option<ModuleParams<'a>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModuleParams<'a> {
-    pub region: Region,
-    pub whole_symbol: Symbol,
-    pub whole_var: Variable,
-    pub record_var: Variable,
-    pub record_ext_var: Variable,
-    pub destructs: &'a [Loc<RecordDestruct<'a>>],
-    // used while lowering passed functions
-    pub arity_by_name: ArenaVecMap<'a, IdentId, usize>,
-}
-
-impl<'a> ModuleParams<'a> {
-    pub fn pattern(&self) -> Loc<Pattern<'a>> {
-        let record_pattern = Pattern::RecordDestructure {
-            whole_var: self.record_var,
-            ext_var: self.record_ext_var,
-            destructs: self.destructs,
-        };
-        let loc_record_pattern = Loc::at(self.region, record_pattern);
-
-        let as_pattern = Pattern::As(Box::new(loc_record_pattern), self.whole_symbol);
-        Loc::at(self.region, as_pattern)
-    }
 }
 
 #[derive(Debug)]
 pub struct RigidVariables<'a> {
     pub named: ArenaVecMap<'a, Variable, Lowercase>,
-    pub named_with_methods: ArenaVecMap<'a, Variable, (Lowercase, Vec<'a, AliasMethod>)>,
+    pub with_methods: ArenaVecMap<'a, Variable, (Lowercase, Vec<'a, AliasMethod>)>,
     pub wildcards: ArenaVecSet<'a, Variable>,
 }
 
@@ -183,7 +157,7 @@ impl<'a> RigidVariables<'a> {
     pub fn new_in(arena: &'a Bump) -> Self {
         Self {
             named: ArenaVecMap::new_in(arena),
-            named_with_methods: ArenaVecMap::new_in(arena),
+            with_methods: ArenaVecMap::new_in(arena),
             wildcards: ArenaVecSet::new_in(arena),
         }
     }
@@ -193,8 +167,7 @@ impl<'a> RigidVariables<'a> {
 pub struct ModuleOutput<'a, 's> {
     pub aliases: ArenaVecMap<'a, Symbol, Alias<'a>>,
     pub rigid_variables: RigidVariables<'a>,
-    pub module_params: Option<ModuleParams<'a>>,
-    pub declarations: Declarations,
+    pub declarations: Declarations<'a>,
     pub exposed_imports: ArenaVecMap<'a, Symbol, Region>,
     pub exposed_symbols: ArenaVecSet<'a, Symbol>,
     pub problems: Vec<'a, Problem>,
@@ -206,22 +179,7 @@ pub struct ModuleOutput<'a, 's> {
     pub has_dbgs: bool,
 }
 
-// #[derive(Debug)]
-// pub struct Module<'a> {
-//     pub module_id: ModuleId,
-//     pub exposed_imports: ArenaVecMap<'a, Symbol, Region>,
-//     pub exposed_symbols: ArenaVecSet<'a, Symbol>,
-//     pub referenced_values: ArenaVecSet<'a, Symbol>,
-//     /// all aliases. `bool` indicates whether it is exposed
-//     pub aliases: ArenaVecMap<'a, Symbol, (bool, Alias)>,
-//     pub alias_methods: ArenaVecMap<'a, Symbol, &'a [AliasMethod]>,
-//     pub rigid_variables: RigidVariables,
-//     pub loc_expects: ArenaVecMap<'a, Region, Vec<'a, ExpectLookup>>,
-//     pub has_dbgs: bool,
-//     pub module_params: Option<ModuleParams<'a>>,
-// }
-
-fn has_no_implementation(expr: &Expr) -> bool {
+fn has_no_implementation<'a>(expr: &Expr<'a>) -> bool {
     match expr {
         Expr::RuntimeError(RuntimeError::NoImplementationNamed { .. }) => true,
         Expr::Closure(closure_data)
@@ -240,29 +198,26 @@ fn has_no_implementation(expr: &Expr) -> bool {
 pub struct BuiltinExposedValues<'b> {
     aliases: ArenaVecMap<'b, Symbol, Alias<'b>>,
     alias_methods: ArenaVecMap<'b, Symbol, &'b [AliasMethod]>,
-    // values: ArenaVecMap,
 }
 
-pub struct InitialScope<'a, 's> {
-    pub scope: Scope<'a, 's>,
+pub struct HeaderState<'a, 's> {
+    pub generated_methods: ArenaVecMap<'a, Symbol, Region>,
     pub exposed_idents: ArenaVecMap<'a, IdentId, (Symbol, Region)>,
     pub required_symbols: ArenaVecSet<'a, Symbol>,
     pub provides: ArenaVecMap<'a, IdentId, (Symbol, Region)>,
 }
 
-fn build_initial_scope<'a, 's, 'b>(
+fn extract_state_from_header<'a, 's, 'b>(
     home: ModuleId,
     module_name: ModuleName,
     header_type: &'a roc_parse::header::HeaderType<'a>,
-    exposed_builtins: &'b BuiltinExposedValues<'b>,
+    scope: &mut Scope<'a, 's>,
     problems: &mut Vec<'a, Problem>,
     ident_ids: &mut IdentIds<'a>,
     arena: &'a Bump,
     scratch_arena: &'s Bump,
-) -> InitialScope<'a, 's> {
+) -> HeaderState<'a, 's> {
     let mut can_exposed_imports = ArenaVecMap::new_in(arena);
-
-    let mut scope = Scope::new(home, module_name, exposed_builtins, scratch_arena);
 
     let (exposed_names, exposed_module_names, required_idents, required_types, provided_idents): (
         &'a [Loc<ExposedName<'a>>],
@@ -376,19 +331,8 @@ fn build_initial_scope<'a, 's, 'b>(
         }
     }
 
-    for (name, alias) in exposed_builtins.aliases.into_iter() {
-        scope.add_alias(
-            name,
-            alias.region,
-            alias.type_variables,
-            alias.infer_ext_in_output_variables,
-            alias.typ,
-            alias.kind,
-        );
-    }
-
-    InitialScope {
-        scope,
+    HeaderState {
+        generated_methods: ArenaVecMap::new_in(arena),
         exposed_idents,
         required_symbols,
         provides,
@@ -417,16 +361,29 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
         exposed_builtins,
     );
 
-    let InitialScope {
-        mut scope,
+    // TODO: initialize scope (including builtins) in a function
+    let mut scope = Scope::new(home, module_name, exposed_builtins, scratch_arena);
+    for (name, alias) in exposed_builtins.aliases.into_iter() {
+        scope.add_alias(
+            name,
+            alias.region,
+            alias.type_variables,
+            alias.infer_ext_in_output_variables,
+            alias.typ,
+            alias.kind,
+        );
+    }
+
+    let HeaderState {
+        provides,
         exposed_idents,
         required_symbols,
-        provides,
-    } = build_initial_scope(
+        generated_methods,
+    } = extract_state_from_header(
         home,
         module_name,
         header_type,
-        exposed_builtins,
+        &mut scope,
         &mut env.problems,
         &mut env.ident_ids,
         arena,
@@ -441,7 +398,7 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
     // operators, and then again on *their* nested operators, ultimately applying the
     // rules multiple times unnecessarily.
 
-    roc_can::desugar::desugar_defs_node_values(&mut env, &mut scope, loc_defs, true);
+    roc_can::desugar::desugar_defs_node_values(&mut env, &mut scope, loc_defs);
 
     let mut rigid_variables = RigidVariables::new_in(arena);
 
@@ -488,44 +445,44 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
 
     let mut output = Output::default();
 
-    let module_params = header_type.get_params().as_ref().map(
-        |roc_parse::header::ModuleParams {
-             pattern,
-             before_arrow: _,
-             after_arrow: _,
-         }| {
-            let desugared_patterns =
-                roc_can::desugar::desugar_record_destructures(&mut env, &mut scope, pattern.value);
+    // let module_params = header_type.get_params().as_ref().map(
+    //     |roc_parse::header::ModuleParams {
+    //          pattern,
+    //          before_arrow: _,
+    //          after_arrow: _,
+    //      }| {
+    //         let desugared_patterns =
+    //             roc_can::desugar::desugar_record_destructures(&mut env, &mut scope, pattern.value);
 
-            let (destructs, _) = canonicalize_record_destructs(
-                &mut env,
-                var_store,
-                &mut scope,
-                &mut output,
-                PatternType::ModuleParams,
-                &desugared_patterns,
-                pattern.region,
-                PermitShadows(false),
-            );
+    //         let (destructs, _) = canonicalize_record_destructs(
+    //             &mut env,
+    //             var_store,
+    //             &mut scope,
+    //             &mut output,
+    //             PatternType::ModuleParams,
+    //             &desugared_patterns,
+    //             pattern.region,
+    //             PermitShadows(false),
+    //         );
 
-            let whole_symbol = scope.gen_unique_symbol();
-            env.top_level_symbols.insert(whole_symbol, ());
+    //         let whole_symbol = scope.gen_unique_symbol();
+    //         env.top_level_symbols.insert(whole_symbol, ());
 
-            let whole_var = var_store.fresh();
+    //         let whole_var = var_store.fresh();
 
-            env.home_params_record = Some((whole_symbol, whole_var));
+    //         env.home_params_record = Some((whole_symbol, whole_var));
 
-            ModuleParams {
-                region: pattern.region,
-                whole_var,
-                whole_symbol,
-                record_var: var_store.fresh(),
-                record_ext_var: var_store.fresh(),
-                destructs,
-                arity_by_name: ArenaVecMap::new_in(arena),
-            }
-        },
-    );
+    //         ModuleParams {
+    //             region: pattern.region,
+    //             whole_var,
+    //             whole_symbol,
+    //             record_var: var_store.fresh(),
+    //             record_ext_var: var_store.fresh(),
+    //             destructs,
+    //             arity_by_name: ArenaVecMap::new_in(arena),
+    //         }
+    //     },
+    // );
 
     let (defs, output, symbols_introduced, imports_introduced) = canonicalize_defs(
         &mut env,
@@ -542,8 +499,6 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
             return_kind: *early_return_kind,
         });
     }
-
-    let pending_derives = output.pending_derives;
 
     // See if any of the new idents we defined went unused.
     // If any were unused and also not exposed, report it.
@@ -566,14 +521,10 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
         rigid_variables.named.insert(named.variable, named.name);
     }
 
-    for able in output.introduced_variables.able {
+    for with_methods in output.introduced_variables.with_methods {
         rigid_variables
-            .able
-            .insert(able.variable, (able.name, able.abilities));
-    }
-
-    for var in output.introduced_variables.wildcards {
-        rigid_variables.wildcards.insert(var.value);
+            .with_methods
+            .insert(with_methods.variable, (able.name, able.abilities));
     }
 
     let mut referenced_values = ArenaVecSet::new_in(arena);
@@ -610,11 +561,6 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
         &exposed_symbols,
     );
 
-    let module_params = module_params.map(|params| ModuleParams {
-        arity_by_name: declarations.take_arity_by_name(),
-        ..params
-    });
-
     debug_assert!(
         output.pending_derives.is_empty(),
         "I thought pending derives are only found during def introduction"
@@ -623,16 +569,12 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
     let symbols_from_requires = symbols_from_requires
         .iter()
         .map(|(symbol, loc_ann)| {
-            // We've already canonicalized the module, so there are no pending abilities.
-            let pending_abilities_in_scope = &Default::default();
-
             let ann = canonicalize_annotation(
                 &mut env,
                 &mut scope,
                 &loc_ann.value,
                 loc_ann.region,
                 var_store,
-                pending_abilities_in_scope,
                 AnnotationFor::Value,
             );
 
@@ -655,12 +597,13 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
     report_unused_imports(imports_introduced, &output.references, &mut env, &mut scope);
 
     for index in 0..declarations.len() {
-        use crate::expr::DeclarationTag::*;
-
         let tag = declarations.declarations[index];
 
         match tag {
-            Value | Function(_) | Recursive(_) | TailRecursive(_) => {
+            DeclarationTag::Value
+            | DeclarationTag::Function(_)
+            | DeclarationTag::Recursive(_)
+            | DeclarationTag::TailRecursive(_) => {
                 let symbol = &declarations.symbols[index].value;
 
                 // Remove this from exposed_symbols,
@@ -713,21 +656,21 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
                     }
                 }
             }
-            Destructure(d_index) => {
+            DeclarationTag::Destructure(d_index) => {
                 let destruct_def = &declarations.destructs[d_index.index()];
 
                 for (symbol, _) in BindingsFromPattern::new(&destruct_def.loc_pattern) {
                     exposed_but_not_defined.remove(&symbol);
                 }
             }
-            MutualRecursion { .. } => {
+            DeclarationTag::MutualRecursion { .. } => {
                 // the declarations of this group will be treaded individually by later iterations
             }
-            Expectation => { /* ignore */ }
+            DeclarationTag::Expectation => { /* ignore */ }
         }
     }
 
-    let mut aliases = MutMap::default();
+    let mut aliases = ArenaVecMap::new_in(env.arena);
 
     for (symbol, alias) in output.aliases {
         // Remove this from exposed_symbols,
@@ -761,7 +704,7 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
 
         // In case this exposed value is referenced by other modules,
         // create a decl for it whose implementation is a runtime error.
-        let mut pattern_vars = SendMap::default();
+        let mut pattern_vars = ArenaVecMap::new_in(env.arena);
         pattern_vars.insert(symbol, var_store.fresh());
 
         let runtime_error = RuntimeError::ExposedButNotDefined(symbol);
@@ -792,13 +735,12 @@ pub fn canonicalize_module_defs<'a, 's, 'b>(
         scope,
         aliases,
         rigid_variables,
-        module_params,
         declarations,
         referenced_values,
         exposed_imports: can_exposed_imports,
         problems: env.problems,
         symbols_from_requires,
-        pending_derives,
+        pending_methods,
         loc_expects: collected.expects,
         has_dbgs: collected.has_dbgs,
         exposed_symbols,

@@ -1,4 +1,4 @@
-use crate::annotation::{freshen_opaque_def, IntroducedVariables};
+use crate::annotation::IntroducedVariables;
 use crate::def::{can_defs_with_return, Def};
 use crate::env::Env;
 use crate::interpolation::flatten_str_literal;
@@ -7,9 +7,8 @@ use crate::num::{
     int_expr_from_result, num_expr_from_result, FloatBound, IntBound, NumBound,
 };
 use crate::pattern::{canonicalize_pattern, BindingsFromPattern, Pattern, PermitShadows};
-use crate::problem::{CompilerProblem, UndesugaredExprKind};
 use crate::procedure::{QualifiedReference, References};
-use crate::scope::{Scope, SymbolLookup};
+use crate::scope::Scope;
 use crate::traverse::walk_expr;
 use bumpalo::collections::{CollectIn, Vec};
 use bumpalo::Bump;
@@ -18,14 +17,17 @@ use roc_module::called_via::CalledVia;
 use roc_module::ident::{ForeignSymbol, Lowercase, TagName};
 use roc_module::low_level::LowLevel;
 use roc_module::symbol::Symbol;
-use roc_parse::ast::{self, Defs, ResultTryKind};
+use roc_parse::ast::{self, Defs};
 use roc_parse::ident::Accessor;
 use roc_parse::pattern::PatternType::*;
-use roc_problem::can::{PrecedenceProblem, Problem, RuntimeError};
+use roc_problem::can::{
+    CompilerProblem, DeprecatedSyntaxKind, PrecedenceProblem, Problem, RuntimeError,
+    UndesugaredExprKind,
+};
 use roc_region::all::{Loc, Region};
 use roc_types::num::SingleQuoteBound;
 use roc_types::subs::{ExhaustiveMark, IllegalCycleMark, RedundantMark, VarStore, Variable};
-use roc_types::types::{Alias, Category, EarlyReturnKind, IndexOrField, OptAbleVar, Type};
+use roc_types::types::{Alias, Category, EarlyReturnKind, IndexOrField, Type};
 use std::fmt::{Debug, Display};
 use std::path::PathBuf;
 use std::{char, u32};
@@ -37,7 +39,6 @@ pub type PendingDerives<'a> = ArenaVecMap<'a, Symbol, (Type, Vec<'a, Loc<Symbol>
 pub struct FunctionDef<'a> {
     function_var: Variable,
     function_expr: Loc<Expr<'a>>,
-    closure_var: Variable,
     return_var: Variable,
     fx_var: Variable,
 }
@@ -48,7 +49,7 @@ pub struct Output<'a> {
     pub tail_calls: Vec<'a, Symbol>,
     pub introduced_variables: IntroducedVariables<'a>,
     pub aliases: ArenaVecMap<'a, Symbol, Alias>,
-    pub non_closures: ArenaVecSet<'a, Symbol>,
+    // pub non_closures: ArenaVecSet<'a, Symbol>,
     pub pending_derives: PendingDerives<'a>,
 }
 
@@ -59,7 +60,7 @@ impl<'a> Output<'a> {
             tail_calls: Vec::new_in(arena),
             introduced_variables: IntroducedVariables::new_in(arena),
             aliases: ArenaVecMap::new_in(arena),
-            non_closures: ArenaVecSet::new_in(arena),
+            // non_closures: ArenaVecSet::new_in(arena),
             pending_derives: PendingDerives::new_in(arena),
         }
     }
@@ -74,7 +75,7 @@ impl<'a> Output<'a> {
         self.introduced_variables
             .union_owned(other.introduced_variables);
         self.aliases.extend(other.aliases);
-        self.non_closures.extend(other.non_closures);
+        // self.non_closures.extend(other.non_closures);
 
         {
             let expected_derives_size = self.pending_derives.len() + other.pending_derives.len();
@@ -249,15 +250,6 @@ pub enum Expr<'a> {
         func_type: &'a FunctionDef<'a>,
         args: &'a [(Variable, Loc<Expr<'a>>)],
     },
-    /// Call a local function in method-calling style on an expression.
-    LocalMethodCall {
-        target_var: Variable,
-        target_expr: &'a Loc<Expr<'a>>,
-        method_var: Variable,
-        method_expr: &'a Loc<Expr<'a>>,
-        func_type: &'a FunctionDef<'a>,
-        args: &'a [(Variable, Loc<Expr<'a>>)],
-    },
     RunLowLevel {
         op: LowLevel,
         args: &'a [(Variable, Expr<'a>)],
@@ -285,14 +277,6 @@ pub enum Expr<'a> {
         elems: &'a [(Variable, &'a Loc<Expr<'a>>)],
     },
 
-    // TODO: remove
-    // /// Module params expression in import
-    // ImportParams {
-    //     module_id: ModuleId,
-    //     region: Region,
-    //     params: Option<(Variable, &'a Expr<'a>)>,
-    // },
-    //
     /// The "crash" keyword
     Crash {
         msg: &'a Loc<Expr<'a>>,
@@ -341,6 +325,7 @@ pub enum Expr<'a> {
         name: TagName,
     },
 
+    // TODO: can we combine Tag* and CustomTag*
     // Custom sum types
     CustomTag {
         union_name: Option<TagName>,
@@ -383,7 +368,6 @@ pub enum Expr<'a> {
         ok_payload_var: Variable,
         err_payload_var: Variable,
         err_ext_var: Variable,
-        kind: TryKind,
     },
 
     Return {
@@ -396,17 +380,9 @@ pub enum Expr<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TryKind {
-    KeywordPrefix,
-    OperatorSuffix,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExpectLookup {
     pub symbol: Symbol,
     pub var: Variable,
-    // TODO: remove?
-    // pub ability_info: Option<SpecializationId>,
 }
 
 impl<'a> Expr<'a> {
@@ -455,9 +431,6 @@ impl<'a> Expr<'a> {
                 args_count: 0,
             },
             &Self::OpaqueRef { name, .. } => Category::OpaqueWrap(name),
-            &Self::OpaqueWrapFunction(OpaqueWrapFunctionData { opaque_name, .. }) => {
-                Category::OpaqueWrap(opaque_name)
-            }
             Self::Expect { .. } => Category::Expect,
             Self::Crash { .. } => Category::Crash,
             Self::Return { .. } => Category::Return(EarlyReturnKind::Return),
@@ -470,6 +443,8 @@ impl<'a> Expr<'a> {
         }
     }
 
+    // TODO: remove this in favor of type-based approach, detailed here:
+    // <https://github.com/roc-lang/roc/pull/7296#issuecomment-2517809364>
     pub fn contains_any_early_returns(&self) -> bool {
         match self {
             Self::Num { .. }
@@ -601,12 +576,10 @@ impl AnnotatedMark {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClosureData<'a> {
     pub function_type: Variable,
-    pub closure_type: Variable,
     pub return_type: Variable,
     pub fx_type: Variable,
     pub early_returns: &'a [(Variable, Region, EarlyReturnKind)],
     pub name: Symbol,
-    pub captured_symbols: &'a [(Symbol, Variable)],
     pub recursive: Recursive,
     pub arguments: &'a [(Variable, AnnotatedMark, Loc<Pattern<'a>>)],
     pub loc_body: &'a Loc<Expr<'a>>,
@@ -623,7 +596,6 @@ pub struct StructAccessorData {
     pub name: Symbol,
     pub function_var: Variable,
     pub record_var: Variable,
-    pub closure_var: Variable,
     pub ext_var: Variable,
     pub field_var: Variable,
 
@@ -639,7 +611,6 @@ impl StructAccessorData {
             name,
             function_var,
             record_var,
-            closure_var,
             ext_var,
             field_var,
             field,
@@ -679,84 +650,10 @@ impl StructAccessorData {
 
         ClosureData {
             function_type: function_var,
-            closure_type: closure_var,
             return_type: field_var,
             fx_type: Variable::PURE,
             early_returns: &[],
             name,
-            captured_symbols: &[],
-            recursive: Recursive::NotRecursive,
-            arguments,
-            loc_body: arena.alloc(loc_body),
-        }
-    }
-}
-
-/// An opaque wrapper like `@Foo`, which is equivalent to `\p -> @Foo p`
-/// These are desugared to closures, but we distinguish them so we can have
-/// better error messages during constraint generation.
-#[derive(Clone, Debug, PartialEq)]
-pub struct OpaqueWrapFunctionData<'a> {
-    pub opaque_name: Symbol,
-    pub opaque_var: Variable,
-    // The following fields help link the concrete opaque type; see
-    // `Expr::OpaqueRef` for more info on how they're used.
-    pub specialized_def_type: Type,
-    pub type_arguments: &'a [OptAbleVar],
-
-    pub function_name: Symbol,
-    pub function_var: Variable,
-    pub argument_var: Variable,
-    pub closure_var: Variable,
-}
-
-impl<'a> OpaqueWrapFunctionData<'a> {
-    pub fn to_closure_data(self, argument_symbol: Symbol, arena: &'a Bump) -> ClosureData<'a> {
-        let OpaqueWrapFunctionData {
-            opaque_name,
-            opaque_var,
-            specialized_def_type,
-            type_arguments,
-            function_name,
-            function_var,
-            argument_var,
-            closure_var,
-        } = self;
-
-        // IDEA: convert
-        //
-        // @Foo
-        //
-        // into
-        //
-        // (\p -> @Foo p)
-        let body = Expr::OpaqueRef {
-            opaque_var,
-            name: opaque_name,
-            argument: Box::new((
-                argument_var,
-                Loc::at_zero(Expr::Var(argument_symbol, argument_var)),
-            )),
-            specialized_def_type: Box::new(specialized_def_type),
-            type_arguments,
-        };
-
-        let loc_body = Loc::at_zero(body);
-
-        let arguments = &[(
-            argument_var,
-            AnnotatedMark::known_exhaustive(),
-            Loc::at_zero(Pattern::Identifier(argument_symbol)),
-        )];
-
-        ClosureData {
-            function_type: function_var,
-            closure_type: closure_var,
-            return_type: opaque_var,
-            fx_type: Variable::PURE,
-            early_returns: &[],
-            name: function_name,
-            captured_symbols: &[],
             recursive: Recursive::NotRecursive,
             arguments,
             loc_body: arena.alloc(loc_body),
@@ -813,10 +710,8 @@ pub fn canonicalize_expr<'a, 'b>(
     region: Region,
     expr: &'a ast::Expr<'a>,
 ) -> (Loc<Expr<'a>>, Output<'a>) {
-    use Expr::*;
-
-    let report_runtime_error = |error: roc_problem::can::RuntimeError| {
-        env.problem(RuntimeError(error));
+    let report_runtime_error = |error: RuntimeError| {
+        env.problem(Expr::RuntimeError(error));
 
         error
     };
@@ -832,44 +727,47 @@ pub fn canonicalize_expr<'a, 'b>(
 
             (answer, Output::default())
         }
-        ast::Expr::Record(fields) => canonicalize_record(env, var_store, scope, region, *fields),
+        ast::Expr::Record(fields) => {
+            if fields.is_empty() {
+                return (Expr::EmptyRecord, Output::new_in(env.arena));
+            }
+
+            let (can_fields, output) =
+                canonicalize_fields(env, var_store, scope, region, fields.items);
+
+            (
+                Expr::Record {
+                    record_var: var_store.fresh(),
+                    fields: can_fields,
+                },
+                output,
+            )
+        }
         ast::Expr::RecordUpdate {
             fields,
             update: loc_update,
         } => {
             let (can_update, update_out) =
                 canonicalize_expr(env, var_store, scope, loc_update.region, &loc_update.value);
-            if let Var { symbol, .. } = &can_update.value {
-                match canonicalize_fields(env, var_store, scope, region, fields.items) {
-                    Ok((can_fields, mut output)) => {
-                        output.references.union_mut(&update_out.references);
+            if let Expr::Var { symbol, .. } = &can_update.value {
+                let (can_fields, mut output) =
+                    canonicalize_fields(env, var_store, scope, region, fields.items);
+                output.references.union_mut(&update_out.references);
 
-                        let answer = RecordUpdate {
-                            record_var: var_store.fresh(),
-                            ext_var: var_store.fresh(),
-                            symbol: *symbol,
-                            updates: can_fields,
-                        };
+                let answer = Expr::RecordUpdate {
+                    record_var: var_store.fresh(),
+                    ext_var: var_store.fresh(),
+                    symbol: *symbol,
+                    updates: can_fields,
+                };
 
-                        (answer, output)
-                    }
-                    Err(CanonicalizeRecordProblem::InvalidOptionalValue {
-                        field_name,
-                        field_region,
-                        record_region,
-                    }) => (
-                        Expr::RuntimeError(roc_problem::can::RuntimeError::InvalidOptionalValue {
-                            field_name,
-                            field_region,
-                            record_region,
-                        }),
-                        Output::default(),
-                    ),
-                }
+                (answer, output)
             } else {
+                // TODO: will this be true with future record update syntax?
+                //
                 // only (optionally qualified) variables can be updated, not arbitrary expressions
                 (
-                    report_runtime_error(roc_problem::can::RuntimeError::InvalidRecordUpdate {
+                    report_runtime_error(RuntimeError::InvalidRecordUpdate {
                         region: can_update.region,
                     }),
                     Output::new_in(env.arena),
@@ -896,7 +794,7 @@ pub fn canonicalize_expr<'a, 'b>(
             };
 
             (
-                Tuple {
+                Expr::Tuple {
                     tuple_var: var_store.fresh(),
                     elems: can_elems,
                 },
@@ -921,14 +819,14 @@ pub fn canonicalize_expr<'a, 'b>(
                     )
                 } else {
                     // multiple chars is found
-                    let error = roc_problem::can::RuntimeError::MultipleCharsInSingleQuote(region);
+                    let error = RuntimeError::MultipleCharsInSingleQuote(region);
                     let answer = Expr::RuntimeError(error);
 
                     (answer, Output::default())
                 }
             } else {
                 // no characters found
-                let error = roc_problem::can::RuntimeError::EmptySingleQuote(region);
+                let error = RuntimeError::EmptySingleQuote(region);
                 let answer = Expr::RuntimeError(error);
 
                 (answer, Output::default())
@@ -938,7 +836,7 @@ pub fn canonicalize_expr<'a, 'b>(
         ast::Expr::List(loc_elems) => {
             if loc_elems.is_empty() {
                 (
-                    List {
+                    Expr::List {
                         elem_var: var_store.fresh(),
                         loc_elems: Vec::new(),
                     },
@@ -963,7 +861,7 @@ pub fn canonicalize_expr<'a, 'b>(
                 };
 
                 (
-                    List {
+                    Expr::List {
                         elem_var: var_store.fresh(),
                         loc_elems: can_elems,
                     },
@@ -989,50 +887,14 @@ pub fn canonicalize_expr<'a, 'b>(
             }
 
             if let ast::Expr::OpaqueRef(name) = loc_fn.value {
-                // We treat opaques specially, since an opaque can wrap exactly one argument.
-
-                debug_assert!(!args.is_empty());
-
-                if args.len() > 1 {
-                    let problem =
-                        roc_problem::can::RuntimeError::OpaqueAppliedToMultipleArgs(region);
-                    env.problem(Problem::RuntimeError(problem.clone()));
-                    (RuntimeError(problem), output)
-                } else {
-                    match scope.lookup_opaque_ref(name, loc_fn.region) {
-                        Err(runtime_error) => {
-                            env.problem(Problem::RuntimeError(runtime_error.clone()));
-                            (RuntimeError(runtime_error), output)
-                        }
-                        Ok((name, opaque_def)) => {
-                            let argument = Box::new(args.pop().unwrap());
-                            output
-                                .references
-                                .insert_type_lookup(name, QualifiedReference::Unqualified);
-
-                            let (type_arguments, lambda_set_variables, specialized_def_type) =
-                                freshen_opaque_def(var_store, opaque_def);
-
-                            // TODO
-                            let opaque_ref = OpaqueRef {
-                                opaque_var: var_store.fresh(),
-                                name,
-                                argument,
-                                specialized_def_type: Box::new(specialized_def_type),
-                                type_arguments,
-                                lambda_set_variables,
-                            };
-
-                            (opaque_ref, output)
-                        }
-                    }
-                }
+                report_runtime_error(RuntimeError::CompilerProblem(
+                    CompilerProblem::DeprecatedSyntax(DeprecatedSyntaxKind::OpaqueRef),
+                    region,
+                ))
             } else if let ast::Expr::Crash = loc_fn.value {
                 // We treat crash specially, since crashing must be applied with one argument.
 
-                debug_assert!(!args.is_empty());
-
-                let mut args = Vec::new();
+                let mut args = Vec::new_in(env.arena);
                 let mut output = Output::default();
 
                 for loc_arg in loc_args.iter() {
@@ -1043,27 +905,33 @@ pub fn canonicalize_expr<'a, 'b>(
                     output.references.union_mut(&arg_out.references);
                 }
 
-                let crash = if args.len() > 1 {
-                    let args_region = Region::span_across(
-                        &loc_args.first().unwrap().region,
-                        &loc_args.last().unwrap().region,
-                    );
-                    env.problem(Problem::OverAppliedCrash {
-                        region: args_region,
-                    });
-                    // Still crash, just with our own message, and drop the references.
-                    Crash {
-                        msg: env.arena.alloc(Loc::at(
-                            region,
-                            Expr::Str(String::from("hit a crash!").into_boxed_str()),
-                        )),
+                let crash = match &args[..] {
+                    &[single_arg] => Expr::Crash {
+                        msg: env.arena.alloc(single_arg),
                         ret_var: var_store.fresh(),
+                    },
+                    &[] => {
+                        env.problem(Problem::UnappliedCrash { region });
+
+                        Expr::Crash {
+                            msg: env.arena.alloc(Loc::at(region, Expr::Str("hit a crash!"))),
+                            ret_var: var_store.fresh(),
+                        }
                     }
-                } else {
-                    let msg = args.pop().unwrap();
-                    Crash {
-                        msg: env.arena.alloc(msg),
-                        ret_var: var_store.fresh(),
+                    &[first_arg, .., last_arg] => {
+                        let args_region = Region::span_across(&first_arg.region, &last_arg.region);
+                        env.problem(Problem::OverAppliedCrash {
+                            region: args_region,
+                        });
+
+                        // Still crash, just with our own message, and drop the references.
+                        Expr::Crash {
+                            msg: env.arena.alloc(Loc::at(
+                                region,
+                                Expr::Str(String::from("hit a crash!").into_boxed_str()),
+                            )),
+                            ret_var: var_store.fresh(),
+                        }
                     }
                 };
 
@@ -1075,54 +943,42 @@ pub fn canonicalize_expr<'a, 'b>(
 
                 output.union(fn_expr_output);
 
-                // Default: We're not tail-calling a symbol (by name), we're tail-calling a function value.
-                output.tail_calls = vec![];
-
                 let expr = match fn_expr.value {
-                    Var { symbol, .. } => {
+                    Expr::Var { symbol, .. } => {
                         output.references.insert_call(symbol);
 
-                        // we're tail-calling a symbol by name, check if it's the tail-callable symbol
-                        if env
-                            .tailcallable_symbol
-                            .is_some_and(|tc_sym| tc_sym == symbol)
-                        {
-                            output.tail_calls.push(symbol);
-                        }
-
-                        Call {
-                            func_type: env.arena.alloc((
-                                var_store.fresh(),
-                                fn_expr,
-                                var_store.fresh(),
-                                var_store.fresh(),
-                                var_store.fresh(),
-                            )),
+                        Expr::Call {
+                            func_type: env.arena.alloc(FunctionDef {
+                                function_var: var_store.fresh(),
+                                function_expr: fn_expr,
+                                return_var: var_store.fresh(),
+                                fx_var: var_store.fresh(),
+                            }),
                             args,
                             called_via: *application_style,
                         }
                     }
-                    RuntimeError(_) => {
+                    Expr::RuntimeError(_) => {
                         // We can't call a runtime error; bail out by propagating it!
                         return (fn_expr, output);
                     }
-                    Tag {
+                    Expr::Tag {
                         tag_union_var: variant_var,
                         ext_var,
                         name,
                         ..
-                    } => Tag {
+                    } => Expr::Tag {
                         tag_union_var: variant_var,
                         ext_var,
                         name,
                         arguments: args,
                     },
-                    ZeroArgumentTag {
+                    Expr::ZeroArgumentTag {
                         variant_var,
                         ext_var,
                         name,
                         ..
-                    } => Tag {
+                    } => Expr::Tag {
                         tag_union_var: variant_var,
                         ext_var,
                         name,
@@ -1130,7 +986,7 @@ pub fn canonicalize_expr<'a, 'b>(
                     },
                     _ => {
                         // This could be something like ((if True then fn1 else fn2) arg1 arg2).
-                        Call {
+                        Expr::Call {
                             func_type: env.arena.alloc((
                                 var_store.fresh(),
                                 fn_expr,
@@ -1153,7 +1009,7 @@ pub fn canonicalize_expr<'a, 'b>(
         ast::Expr::Underscore(name) => {
             // we parse underscores, but they are not valid expression syntax
             (
-                report_runtime_error(roc_problem::can::RuntimeError::MalformedIdentifier(
+                report_runtime_error(RuntimeError::MalformedIdentifier(
                     (*name).into(),
                     if name.is_empty() {
                         roc_parse::ident::BadIdent::UnderscoreAlone(region.start())
@@ -1175,7 +1031,7 @@ pub fn canonicalize_expr<'a, 'b>(
             env.problem(Problem::UnappliedCrash { region });
 
             (
-                Crash {
+                Expr::Crash {
                     msg: env.arena.alloc(Loc::at(
                         region,
                         Expr::Str(String::from("hit a crash!").into_boxed_str()),
@@ -1192,27 +1048,19 @@ pub fn canonicalize_expr<'a, 'b>(
                 can_defs_with_return(env, var_store, inner_scope, env.arena.alloc(defs), loc_ret)
             })
         }
-        ast::Expr::RecordBuilder { .. } => {
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::RecordBuilder,
-                },
-            ))
-        }
-        ast::Expr::RecordUpdater(_) => {
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::RecordUpdater,
-                },
-            ))
-        }
+        ast::Expr::RecordBuilder { .. } => report_runtime_error(RuntimeError::CompilerProblem(
+            CompilerProblem::UndesugaredExpr(UndesugaredExprKind::RecordBuilder),
+            region,
+        )),
+        ast::Expr::RecordUpdater(_) => report_runtime_error(RuntimeError::CompilerProblem(
+            CompilerProblem::UndesugaredExpr(UndesugaredExprKind::RecordUpdater),
+            region,
+        )),
         ast::Expr::Closure(loc_arg_patterns, loc_body_expr) => {
             let (closure_data, output) =
                 canonicalize_closure(env, var_store, scope, loc_arg_patterns, loc_body_expr, None);
 
-            (Closure(closure_data), output)
+            (Expr::Closure(closure_data), output)
         }
         ast::Expr::When(loc_cond, branches) => {
             // Infer the condition expression's type.
@@ -1220,8 +1068,8 @@ pub fn canonicalize_expr<'a, 'b>(
             let (can_cond, mut output) =
                 canonicalize_expr(env, var_store, scope, loc_cond.region, &loc_cond.value);
 
-            // the condition can never be a tail-call
-            output.tail_calls = vec![];
+            // // the condition can never be a tail-call
+            // output.tail_calls = vec![];
 
             let mut can_branches = Vec::with_capacity(branches.len());
 
@@ -1242,15 +1090,15 @@ pub fn canonicalize_expr<'a, 'b>(
                 can_branches.push(can_when_branch);
             }
 
-            // A "when" with no branches is a runtime error, but it will mess things up
-            // if code gen mistakenly thinks this is a tail call just because its condition
-            // happened to be one. (The condition gave us our initial output value.)
-            if branches.is_empty() {
-                output.tail_calls = vec![];
-            }
+            // // A "when" with no branches is a runtime error, but it will mess things up
+            // // if code gen mistakenly thinks this is a tail call just because its condition
+            // // happened to be one. (The condition gave us our initial output value.)
+            // if branches.is_empty() {
+            //     output.tail_calls = vec![];
+            // }
 
             // Incorporate all three expressions into a combined Output value.
-            let expr = When {
+            let expr = Expr::When {
                 expr_var: var_store.fresh(),
                 cond_var,
                 region,
@@ -1266,7 +1114,7 @@ pub fn canonicalize_expr<'a, 'b>(
             let (loc_expr, output) = canonicalize_expr(env, var_store, scope, region, record_expr);
 
             (
-                RecordAccess {
+                Expr::RecordAccess {
                     record_var: var_store.fresh(),
                     field_var: var_store.fresh(),
                     ext_var: var_store.fresh(),
@@ -1277,12 +1125,11 @@ pub fn canonicalize_expr<'a, 'b>(
             )
         }
         ast::Expr::AccessorFunction(field) => (
-            RecordAccessor(StructAccessorData {
+            Expr::RecordAccessor(StructAccessorData {
                 name: scope.gen_unique_symbol(),
                 function_var: var_store.fresh(),
                 record_var: var_store.fresh(),
                 ext_var: var_store.fresh(),
-                closure_var: var_store.fresh(),
                 field_var: var_store.fresh(),
                 field: match field {
                     Accessor::RecordField(field) => IndexOrField::Field((*field).into()),
@@ -1295,7 +1142,7 @@ pub fn canonicalize_expr<'a, 'b>(
             let (loc_expr, output) = canonicalize_expr(env, var_store, scope, region, tuple_expr);
 
             (
-                TupleAccess {
+                Expr::TupleAccess {
                     tuple_var: var_store.fresh(),
                     ext_var: var_store.fresh(),
                     elem_var: var_store.fresh(),
@@ -1305,18 +1152,14 @@ pub fn canonicalize_expr<'a, 'b>(
                 output,
             )
         }
-        ast::Expr::TrySuffix { .. } => {
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::TrySuffix,
-                },
-            ))
-        }
-        ast::Expr::Try => {
-            // Treat remaining `try` keywords as normal variables so that we can continue to support `Result.try`
-            canonicalize_var_lookup(env, var_store, scope, "", "try", region)
-        }
+        ast::Expr::TrySuffix(_) => report_runtime_error(RuntimeError::CompilerProblem(
+            CompilerProblem::UndesugaredExpr(UndesugaredExprKind::TrySuffix),
+            region,
+        )),
+        ast::Expr::Try => report_runtime_error(RuntimeError::CompilerProblem(
+            CompilerProblem::UndesugaredExpr(UndesugaredExprKind::TryKeyword),
+            region,
+        )),
 
         // TODO: if a custom tag union variant with this name is in scope, consider this a `ZeroArgumentCustomTag` instead
         ast::Expr::Tag(tag) => {
@@ -1326,7 +1169,7 @@ pub fn canonicalize_expr<'a, 'b>(
             let symbol = scope.gen_unique_symbol();
 
             (
-                ZeroArgumentTag {
+                Expr::ZeroArgumentTag {
                     name: TagName((*tag).into()),
                     variant_var,
                     closure_name: symbol,
@@ -1335,44 +1178,6 @@ pub fn canonicalize_expr<'a, 'b>(
                 Output::default(),
             )
         }
-        // ast::Expr::OpaqueRef(name) => {
-        //     // If we're here, the opaque reference is definitely not wrapping an argument - wrapped
-        //     // arguments are handled in the Apply branch.
-        //     // Treat this as a function \payload -> @Opaque payload
-        //     match scope.lookup_opaque_ref(name, region) {
-        //         Err(runtime_error) => {
-        //             env.problem(Problem::RuntimeError(runtime_error.clone()));
-        //             (RuntimeError(runtime_error), Output::default())
-        //         }
-        //         Ok((name, opaque_def)) => {
-        //             let mut output = Output::default();
-        //             output
-        //                 .references
-        //                 .insert_type_lookup(name, QualifiedReference::Unqualified);
-
-        //             let (type_arguments, lambda_set_variables, specialized_def_type) =
-        //                 freshen_opaque_def(var_store, opaque_def);
-
-        //             let fn_symbol = scope.gen_unique_symbol();
-
-        //             (
-        //                 OpaqueWrapFunction(OpaqueWrapFunctionData {
-        //                     opaque_name: name,
-        //                     opaque_var: var_store.fresh(),
-        //                     specialized_def_type,
-        //                     type_arguments,
-        //                     lambda_set_variables,
-
-        //                     function_name: fn_symbol,
-        //                     function_var: var_store.fresh(),
-        //                     argument_var: var_store.fresh(),
-        //                     closure_var: var_store.fresh(),
-        //                 }),
-        //                 output,
-        //             )
-        //         }
-        //     }
-        // }
         ast::Expr::Dbg => {
             // Dbg was not desugared as either part of an `Apply` or a `Pizza` binop, so it's
             // invalid.
@@ -1385,14 +1190,10 @@ pub fn canonicalize_expr<'a, 'b>(
 
             (loc_expr.value, output)
         }
-        ast::Expr::DbgStmt { .. } => {
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::DbgStmt,
-                },
-            ))
-        }
+        ast::Expr::DbgStmt { .. } => report_runtime_error(RuntimeError::CompilerProblem(
+            CompilerProblem::UndesugaredExpr(UndesugaredExprKind::DbgStmt),
+            region,
+        )),
         ast::Expr::LowLevelDbg((source_location, source), message, continuation) => {
             let mut output = Output::default();
 
@@ -1419,7 +1220,7 @@ pub fn canonicalize_expr<'a, 'b>(
             };
 
             (
-                Dbg {
+                Expr::Dbg {
                     source_location: (*source_location).into(),
                     source: (*source).into(),
                     loc_message: env.arena.alloc(loc_message),
@@ -1441,17 +1242,13 @@ pub fn canonicalize_expr<'a, 'b>(
                 .push((return_var, loc_expr.region, EarlyReturnKind::Try));
 
             (
-                Try {
+                Expr::Try {
                     result_expr: env.arena.alloc(loc_result_expr),
                     result_var: var_store.fresh(),
                     return_var,
                     ok_payload_var: var_store.fresh(),
                     err_payload_var: var_store.fresh(),
                     err_ext_var: var_store.fresh(),
-                    kind: match kind {
-                        ResultTryKind::KeywordPrefix => TryKind::KeywordPrefix,
-                        ResultTryKind::OperatorSuffix => TryKind::OperatorSuffix,
-                    },
                 },
                 output,
             )
@@ -1485,7 +1282,7 @@ pub fn canonicalize_expr<'a, 'b>(
                 .push((return_var, return_expr.region, EarlyReturnKind::Return));
 
             (
-                Return {
+                Expr::Return {
                     return_value: env.arena.alloc(loc_return_expr),
                     return_var,
                 },
@@ -1529,7 +1326,7 @@ pub fn canonicalize_expr<'a, 'b>(
             output.references.union_mut(&else_output.references);
 
             (
-                If {
+                Expr::If {
                     cond_var: var_store.fresh(),
                     branch_var: var_store.fresh(),
                     branches,
@@ -1567,12 +1364,12 @@ pub fn canonicalize_expr<'a, 'b>(
             env.problem(Problem::PrecedenceProblem(problem.clone()));
 
             (
-                RuntimeError(InvalidPrecedence(problem, region)),
+                Expr::RuntimeError(InvalidPrecedence(problem, region)),
                 Output::default(),
             )
         }
         ast::Expr::MalformedIdent(name, bad_ident) => (
-            report_runtime_error(roc_problem::can::RuntimeError::MalformedIdentifier(
+            report_runtime_error(RuntimeError::MalformedIdentifier(
                 (*name).into(),
                 *bad_ident,
                 region,
@@ -1580,31 +1377,26 @@ pub fn canonicalize_expr<'a, 'b>(
             Output::new_in(env.arena),
         ),
         ast::Expr::MalformedSuffixed(..) => (
-            report_runtime_error(roc_problem::can::RuntimeError::MalformedSuffixed(region)),
+            report_runtime_error(RuntimeError::MalformedSuffixed(region)),
             Output::new_in(env.arena),
         ),
         ast::Expr::EmptyRecordBuilder(sub_expr) => (
-            report_runtime_error(roc_problem::can::RuntimeError::EmptyRecordBuilder(
-                sub_expr.region,
-            )),
+            report_runtime_error(RuntimeError::EmptyRecordBuilder(sub_expr.region)),
             Output::new_in(env.arena),
         ),
         ast::Expr::SingleFieldRecordBuilder(sub_expr) => (
-            report_runtime_error(roc_problem::can::RuntimeError::SingleFieldRecordBuilder(
-                sub_expr.region,
-            )),
+            report_runtime_error(RuntimeError::SingleFieldRecordBuilder(sub_expr.region)),
             Output::new_in(env.arena),
         ),
         ast::Expr::OptionalFieldInRecordBuilder(loc_name, loc_value) => {
             let sub_region = Region::span_across(&loc_name.region, &loc_value.region);
 
             (
-                report_runtime_error(
-                    roc_problem::can::RuntimeError::OptionalFieldInRecordBuilder {
-                        record: region,
-                        field: sub_region,
-                    },
-                ),
+                // TODO: convert to deprecated syntax
+                report_runtime_error(RuntimeError::OptionalFieldInRecordBuilder {
+                    record: region,
+                    field: sub_region,
+                }),
                 Output::new_in(env.arena),
             )
         }
@@ -1635,44 +1427,36 @@ pub fn canonicalize_expr<'a, 'b>(
         // Below this point, we shouln't see any of these nodes anymore because
         // operator desugaring should have removed them!
         ast::Expr::SpaceBefore(_, _) => (
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::SpaceBefore,
-                },
+            report_runtime_error(RuntimeError::CompilerProblem(
+                CompilerProblem::UndesugaredExpr(UndesugaredExprKind::SpaceBefore),
+                region,
             )),
             Output::new_in(env.arena),
         ),
         ast::Expr::SpaceAfter(_, _) => (
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::SpaceAfter,
-                },
+            report_runtime_error(RuntimeError::CompilerProblem(
+                CompilerProblem::UndesugaredExpr(UndesugaredExprKind::SpaceAfter),
+                region,
             )),
             Output::new_in(env.arena),
         ),
         ast::Expr::BinOps(_, _) => (
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::BinOps,
-                },
+            report_runtime_error(RuntimeError::CompilerProblem(
+                CompilerProblem::UndesugaredExpr(UndesugaredExprKind::BinOps),
+                region,
             )),
             Output::new_in(env.arena),
         ),
         ast::Expr::UnaryOp(_, _) => (
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region,
-                    kind: UndesugaredExprKind::UnaryOp,
-                },
+            report_runtime_error(RuntimeError::CompilerProblem(
+                CompilerProblem::UndesugaredExpr(UndesugaredExprKind::UnaryOp),
+                region,
             )),
             Output::new_in(env.arena),
         ),
     };
 
-    // TODO: are these still relevant?
+    // TODO: are these comments still relevant?
     //
     // At the end, diff used_idents and defined_idents to see which were unused.
     // Add warnings for those!
@@ -1688,45 +1472,6 @@ pub fn canonicalize_expr<'a, 'b>(
         },
         output,
     )
-}
-
-pub fn canonicalize_record<'a, 'b>(
-    env: &mut Env<'a, 'b>,
-    var_store: &mut VarStore,
-    scope: &mut Scope,
-    region: Region,
-    fields: ast::Collection<'a, Loc<ast::AssignedField<'a, ast::Expr<'a>>>>,
-) -> (Expr<'a>, Output<'a>) {
-    use Expr::*;
-
-    if fields.is_empty() {
-        return (EmptyRecord, Output::new_in(env.arena));
-    }
-
-    match canonicalize_fields(env, var_store, scope, region, fields.items) {
-        Ok((can_fields, output)) => (
-            Record {
-                record_var: var_store.fresh(),
-                fields: can_fields,
-            },
-            output,
-        ),
-        Err(CanonicalizeRecordProblem::InvalidOptionalValue {
-            field_name,
-            field_region,
-            record_region,
-        }) => {
-            let runtime_error = roc_problem::can::RuntimeError::InvalidOptionalValue {
-                field_name,
-                field_region,
-                record_region,
-            };
-
-            env.problem(Problem::RuntimeError(runtime_error));
-
-            (Expr::RuntimeError(runtime_error), Output::new_in(env.arena))
-        }
-    }
 }
 
 // TODO: validate
@@ -1799,39 +1544,39 @@ fn canonicalize_closure_body<'a, 'b>(
         &loc_body_expr.value,
     );
 
-    let mut references_top_level = false;
+    // let mut references_top_level = false;
 
-    let mut captured_symbols: Vec<_> = new_output
-        .references
-        .value_lookups()
-        .copied()
-        // filter out the closure's name itself
-        .filter(|s| *s != symbol)
-        // symbols bound either in this pattern or deeper down are not captured!
-        .filter(|s| !new_output.references.bound_symbols().any(|x| x == s))
-        .filter(|s| bound_by_argument_patterns.iter().all(|(k, _)| s != k))
-        // filter out top-level symbols those will be globally available, and don't need to be captured
-        .filter(|s| {
-            let is_top_level = env.top_level_symbols.contains(s);
-            references_top_level = references_top_level || is_top_level;
-            !is_top_level
-        })
-        // filter out imported symbols those will be globally available, and don't need to be captured
-        .filter(|s| s.module_id() == env.home)
-        // filter out functions that don't close over anything
-        .filter(|s| !new_output.non_closures.contains(s))
-        .filter(|s| !output.non_closures.contains(s))
-        .map(|s| (s, var_store.fresh()))
-        .collect();
+    // let mut captured_symbols: Vec<_> = new_output
+    //     .references
+    //     .value_lookups()
+    //     .copied()
+    //     // filter out the closure's name itself
+    //     .filter(|s| *s != symbol)
+    //     // symbols bound either in this pattern or deeper down are not captured!
+    //     .filter(|s| !new_output.references.bound_symbols().any(|x| x == s))
+    //     .filter(|s| bound_by_argument_patterns.iter().all(|(k, _)| s != k))
+    //     // filter out top-level symbols those will be globally available, and don't need to be captured
+    //     .filter(|s| {
+    //         let is_top_level = env.top_level_symbols.contains(s);
+    //         references_top_level = references_top_level || is_top_level;
+    //         !is_top_level
+    //     })
+    //     // filter out imported symbols those will be globally available, and don't need to be captured
+    //     .filter(|s| s.module_id() == env.home)
+    //     // filter out functions that don't close over anything
+    //     .filter(|s| !new_output.non_closures.contains(s))
+    //     .filter(|s| !output.non_closures.contains(s))
+    //     .map(|s| (s, var_store.fresh()))
+    //     .collect();
 
-    if references_top_level {
-        if let Some(params_record) = env.home_params_record {
-            // If this module has params and the closure references top-level symbols,
-            // we need to capture the whole record so we can pass it.
-            // The lower_params pass will take care of removing the captures for top-level fns.
-            captured_symbols.push(params_record);
-        }
-    }
+    // if references_top_level {
+    //     if let Some(params_record) = env.home_params_record {
+    //         // If this module has params and the closure references top-level symbols,
+    //         // we need to capture the whole record so we can pass it.
+    //         // The lower_params pass will take care of removing the captures for top-level fns.
+    //         captured_symbols.push(params_record);
+    //     }
+    // }
 
     output.union(new_output);
 
@@ -1865,29 +1610,25 @@ fn canonicalize_closure_body<'a, 'b>(
         });
     }
 
-    // store the references of this function in the Env. This information is used
-    // when we canonicalize a surrounding def (if it exists)
-    env.closures.insert(symbol, output.references.clone());
+    // // store the references of this function in the Env. This information is used
+    // // when we canonicalize a surrounding def (if it exists)
+    // env.closures.insert(symbol, output.references.clone());
 
-    // sort symbols, so we know the order in which they're stored in the closure record
-    captured_symbols.sort();
+    // // sort symbols, so we know the order in which they're stored in the closure record
+    // captured_symbols.sort();
 
-    // store that this function doesn't capture anything. It will be promoted to a
-    // top-level function, and does not need to be captured by other surrounding functions.
-    if captured_symbols.is_empty() {
-        output.non_closures.insert(symbol);
-    }
-
-    let return_type_var = var_store.fresh();
+    // // store that this function doesn't capture anything. It will be promoted to a
+    // // top-level function, and does not need to be captured by other surrounding functions.
+    // if captured_symbols.is_empty() {
+    //     output.non_closures.insert(symbol);
+    // }
 
     let closure_data = ClosureData {
         function_type: var_store.fresh(),
-        closure_type: var_store.fresh(),
-        return_type: return_type_var,
+        return_type: var_store.fresh(),
         fx_type: var_store.fresh(),
         early_returns: scope.early_returns.into_bump_slice(),
         name: symbol,
-        captured_symbols: &captured_symbols.into_bump_slice(),
         recursive: Recursive::NotRecursive,
         arguments: can_args.into_bump_slice(),
         loc_body: env.arena.alloc(loc_body_expr),
@@ -1971,6 +1712,20 @@ fn canonicalize_when_branch<'a, 'b>(
     let mut multi_pattern_variables = MultiPatternVariables::new(branch.patterns.len(), env.arena);
 
     for (i, loc_pattern) in branch.patterns.iter().enumerate() {
+        // TODO: this PermitShadows(i > 0) trick breaks when the second pattern has a duplicate shadow:
+        // ```
+        // foo = \arg ->
+        //     when arg is
+        //         (x, 789) | (x, x) ->
+        //             x + 123
+        // ```
+        //
+        // ── NAME NOT BOUND IN ALL PATTERNS in test.roc ──────────────────────────────────
+        //
+        // x is not bound in all patterns of this when branch
+        //
+        // 5│          (x, 789) | (x, x) ->
+        //              ^
         let permit_shadows = PermitShadows(i > 0); // patterns can shadow symbols defined in the first pattern.
 
         let can_pattern = canonicalize_pattern(
@@ -2063,72 +1818,48 @@ fn canonicalize_when_branch<'a, 'b>(
     )
 }
 
-enum CanonicalizeRecordProblem {
-    InvalidOptionalValue {
-        field_name: Lowercase,
-        field_region: Region,
-        record_region: Region,
-    },
-}
-
 fn canonicalize_fields<'a, 'b>(
     env: &mut Env<'a, 'b>,
     var_store: &mut VarStore,
     scope: &mut Scope,
     region: Region,
     fields: &'a [Loc<ast::AssignedField<'a, ast::Expr<'a>>>],
-) -> Result<(ArenaVecMap<'a, Lowercase, Field<'a>>, Output<'a>), CanonicalizeRecordProblem> {
+) -> (ArenaVecMap<'a, Lowercase, Field<'a>>, Output<'a>) {
     let mut can_fields = ArenaVecMap::new_in(env.arena);
     let mut output = Output::default();
 
     for loc_field in fields.iter() {
-        match canonicalize_field(env, var_store, scope, &loc_field.value) {
-            Ok((label, field_expr, field_out, field_var)) => {
-                let field = Field {
-                    var: field_var,
-                    region: loc_field.region,
-                    loc_expr: env.arena.alloc(field_expr),
-                };
+        let (can_field, field_output) =
+            canonicalize_field(env, var_store, scope, &loc_field.value, loc_field.region);
+        let field = Field {
+            var: can_field.field_var,
+            region: loc_field.region,
+            loc_expr: env.arena.alloc(can_field.loc_expr),
+        };
 
-                let replaced = can_fields.insert(label.clone(), field);
+        // TODO: report an error while still running this code
 
-                if let Some(old) = replaced {
-                    env.problems.push(Problem::DuplicateRecordFieldValue {
-                        field_name: label,
-                        field_region: loc_field.region,
-                        record_region: region,
-                        replaced_region: old.region,
-                    });
-                }
+        let replaced = can_fields.insert(can_field.name, field);
 
-                output.references.union_mut(&field_out.references);
-            }
-            Err(CanonicalizeFieldProblem::InvalidOptionalValue {
-                field_name,
-                field_region,
-            }) => {
-                env.problems.push(Problem::InvalidOptionalValue {
-                    field_name: field_name.clone(),
-                    field_region,
-                    record_region: region,
-                });
-                return Err(CanonicalizeRecordProblem::InvalidOptionalValue {
-                    field_name,
-                    field_region,
-                    record_region: region,
-                });
-            }
+        if let Some(old) = replaced {
+            env.problems.push(Problem::DuplicateRecordFieldValue {
+                field_name: can_field.name,
+                field_region: loc_field.region,
+                record_region: region,
+                replaced_region: old.region,
+            });
         }
+
+        output.references.union_mut(&field_output.references);
     }
 
     Ok((can_fields, output))
 }
 
-enum CanonicalizeFieldProblem {
-    InvalidOptionalValue {
-        field_name: Lowercase,
-        field_region: Region,
-    },
+struct CanonicalizedRecordField<'a> {
+    name: Lowercase,
+    loc_expr: Loc<Expr<'a>>,
+    field_var: Variable,
 }
 
 fn canonicalize_field<'a, 'b>(
@@ -2136,10 +1867,11 @@ fn canonicalize_field<'a, 'b>(
     var_store: &mut VarStore,
     scope: &mut Scope,
     field: &'a ast::AssignedField<'a, ast::Expr<'a>>,
-) -> Result<(Lowercase, Loc<Expr<'a>>, Output<'a>, Variable), CanonicalizeFieldProblem> {
+    region: Region,
+) -> (CanonicalizedRecordField<'a>, Output<'a>) {
     use roc_parse::ast::AssignedField::*;
 
-    let report_runtime_error = |runtime_error: roc_problem::can::RuntimeError| {
+    let report_runtime_error = |runtime_error: RuntimeError| {
         env.problem(Problem::RuntimeError(runtime_error));
 
         Expr::RuntimeError(runtime_error)
@@ -2152,39 +1884,33 @@ fn canonicalize_field<'a, 'b>(
             let (loc_can_expr, output) =
                 canonicalize_expr(env, var_store, scope, loc_expr.region, &loc_expr.value);
 
-            Ok((
-                Lowercase::from(label.value),
-                loc_can_expr,
+            (
+                CanonicalizedRecordField {
+                    name: Lowercase::from(label.value),
+                    loc_expr: loc_can_expr,
+                    field_var,
+                },
                 output,
-                field_var,
-            ))
+            )
         }
 
-        OptionalValue(label, _, loc_expr) => Err(CanonicalizeFieldProblem::InvalidOptionalValue {
-            field_name: Lowercase::from(label.value),
-            field_region: Region::span_across(&label.region, &loc_expr.region),
-        }),
+        OptionalValue(label, _, loc_expr) => report_runtime_error(RuntimeError::CompilerProblem(
+            CompilerProblem::DeprecatedSyntax(DeprecatedSyntaxKind::OptionalFieldValue),
+            region,
+        )),
+        IgnoredValue(ignored_field_name, _, _) => {
+            report_runtime_error(RuntimeError::CompilerProblem(
+                CompilerProblem::UndesugaredExpr(UndesugaredExprKind::IgnoredValueRecordField),
+                ignored_field_name.region,
+            ))
+        }
+        LabelOnly(label_name) => report_runtime_error(RuntimeError::CompilerProblem(
+            CompilerProblem::UndesugaredExpr(UndesugaredExprKind::LabelOnlyRecordField),
+            label_name.region,
+        )),
 
         SpaceBefore(sub_field, _) | SpaceAfter(sub_field, _) => {
-            canonicalize_field(env, var_store, scope, sub_field)
-        }
-
-        IgnoredValue(ignored_field_name, _, _) => {
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region: ignored_field_name.region,
-                    kind: UndesugaredExprKind::IgnoredValueRecordField,
-                },
-            ))
-        }
-
-        LabelOnly(label_name) => {
-            report_runtime_error(roc_problem::can::RuntimeError::CompilerProblem(
-                CompilerProblem::ExprShouldHaveBeenDesugared {
-                    region: label_name.region,
-                    kind: UndesugaredExprKind::LabelOnlyRecordField,
-                },
-            ))
+            canonicalize_field(env, var_store, scope, sub_field, region)
         }
     }
 }
@@ -2197,7 +1923,7 @@ fn canonicalize_var_lookup<'a, 'b>(
     ident: &str,
     region: Region,
 ) -> (Expr<'a>, Output<'a>) {
-    let report_runtime_error = |runtime_error: roc_problem::can::RuntimeError| {
+    let report_runtime_error = |runtime_error: RuntimeError| {
         env.problem(Problem::RuntimeError(runtime_error));
 
         Expr::RuntimeError(runtime_error)
@@ -2208,12 +1934,12 @@ fn canonicalize_var_lookup<'a, 'b>(
         // Since module_name was empty, this is an unqualified var.
         // Look it up in scope!
         match scope.lookup_str(ident, region) {
-            Ok(lookup) => {
+            Ok(symbol) => {
                 output
                     .references
-                    .insert_value_lookup(lookup, QualifiedReference::Unqualified);
+                    .insert_value_lookup(symbol, QualifiedReference::Unqualified);
 
-                lookup_to_expr(var_store, lookup)
+                Expr::Var(symbol, var_store.fresh())
             }
             Err(runtime_error) => report_runtime_error(runtime_error),
         }
@@ -2221,12 +1947,12 @@ fn canonicalize_var_lookup<'a, 'b>(
         // Since module_name was nonempty, this is a qualified var.
         // Look it up in the env!
         match env.qualified_lookup(scope, module_name, ident, region) {
-            Ok(lookup) => {
+            Ok(symbol) => {
                 output
                     .references
-                    .insert_value_lookup(lookup, QualifiedReference::Qualified);
+                    .insert_value_lookup(symbol, QualifiedReference::Qualified);
 
-                lookup_to_expr(var_store, lookup)
+                Expr::Var(symbol, var_store.fresh())
             }
             // Either the module wasn't imported, or
             // it was imported but it doesn't expose this ident.
@@ -2237,25 +1963,6 @@ fn canonicalize_var_lookup<'a, 'b>(
     // If it's valid, this ident should be in scope already.
 
     (can_expr, output)
-}
-
-fn lookup_to_expr(
-    var_store: &mut VarStore,
-    SymbolLookup {
-        symbol,
-        module_params,
-    }: SymbolLookup,
-) -> Expr {
-    if let Some((params_var, params_symbol)) = module_params {
-        Expr::ParamsVar {
-            symbol,
-            var: var_store.fresh(),
-            params_symbol,
-            params_var,
-        }
-    } else {
-        Expr::Var(symbol, var_store.fresh())
-    }
 }
 
 pub(crate) fn get_lookup_symbols<'a>(expr: &Expr) -> Vec<'a, ExpectLookup> {
@@ -2277,14 +1984,6 @@ pub(crate) fn get_lookup_symbols<'a>(expr: &Expr) -> Vec<'a, ExpectLookup> {
                 ..
             } => {
                 // Don't introduce duplicates, or make unused variables
-                if !lookups.iter().any(|l| l.symbol == *symbol) {
-                    lookups.push(ExpectLookup {
-                        symbol: *symbol,
-                        var: *var,
-                    });
-                }
-            }
-            Expr::AbilityMember(symbol, spec_id, var) => {
                 if !lookups.iter().any(|l| l.symbol == *symbol) {
                     lookups.push(ExpectLookup {
                         symbol: *symbol,
@@ -2324,14 +2023,14 @@ pub(crate) fn get_lookup_symbols<'a>(expr: &Expr) -> Vec<'a, ExpectLookup> {
 
                 stack.push(&final_else.value);
             }
-            Expr::LetRec(defs, expr, _illegal_cycle_mark) => {
+            Expr::Let {
+                defs,
+                continuation,
+                cycle_mark: _,
+            } => {
                 for def in defs {
                     stack.push(&def.loc_expr.value);
                 }
-                stack.push(&expr.value);
-            }
-            Expr::LetNonRec(def, expr) => {
-                stack.push(&def.loc_expr.value);
                 stack.push(&expr.value);
             }
             Expr::Call(boxed_expr, args, _called_via) => {
@@ -2495,7 +2194,6 @@ pub fn toplevel_expect_to_inline_expect_pure<'a>(
 
 pub struct ExpectCollector<'a> {
     pub expects: ArenaVecMap<'a, Region, Vec<'a, ExpectLookup>>,
-    pub has_dbgs: bool,
 }
 
 impl<'a> crate::traverse::Visitor for ExpectCollector<'a> {
@@ -2508,9 +2206,6 @@ impl<'a> crate::traverse::Visitor for ExpectCollector<'a> {
             } => {
                 self.expects
                     .insert(loc_condition.region, lookups_in_cond.to_vec());
-            }
-            Expr::Dbg { .. } => {
-                self.has_dbgs = true;
             }
             _ => (),
         }

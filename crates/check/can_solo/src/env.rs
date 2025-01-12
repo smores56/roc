@@ -31,15 +31,12 @@ pub struct Env<'a, 'b> {
     //     by_id: Vec<'a, PQModuleName<'a>>,
     // }
     // pub qualified_module_ids: &'a PackageModuleIds<'a>,
-    pub qualified_module_ids: Vec<'a, (ModuleId, PQModuleName<'a>)>,
-
+    // pub qualified_module_ids: Vec<'a, (ModuleId, PQModuleName<'a>)>,
     /// Problems we've encountered along the way, which will be reported to the user at the end.
     pub problems: Vec<'a, Problem>,
 
-    pub compiler_problems: Vec<'a, CompilerProblem>,
-
-    /// Closures
-    pub closures: ArenaVecMap<'a, Symbol, References<'a>>,
+    // /// Closures
+    // pub closures: ArenaVecMap<'a, Symbol, References<'a>>,
 
     // TODO: can this be removed and only kept in Scope?
     // /// current tail-callable symbol
@@ -48,10 +45,11 @@ pub struct Env<'a, 'b> {
     /// Symbols of values/functions which were referenced by qualified lookups.
     pub qualified_value_lookups: ArenaVecMap<'a, Symbol, ()>,
 
-    pub top_level_symbols: ArenaVecMap<'a, Symbol, ()>,
+    // only needed for closure captures
+    //
+    // pub top_level_symbols: ArenaVecMap<'a, Symbol, ()>,
 
-    pub home_params_record: Option<(Symbol, Variable)>,
-
+    // pub home_params_record: Option<(Symbol, Variable)>,
     pub arena: &'a Bump,
 
     pub ident_ids: IdentIds<'a>,
@@ -88,13 +86,11 @@ impl<'a, 'b> Env<'a, 'b> {
             arena,
             module_path,
             builtin_idents,
-            qualified_module_ids: Vec::new_in(arena),
+            // qualified_module_ids: Vec::new_in(arena),
             problems: Vec::new_in(arena),
             compiler_problems: Vec::new_in(arena),
-            closures: ArenaVecMap::new_in(arena),
+            // closures: ArenaVecMap::new_in(arena),
             qualified_value_lookups: ArenaVecMap::new_in(arena),
-            top_level_symbols: ArenaVecMap::new_in(arena),
-            home_params_record: None,
             ident_ids: IdentIds::new_in(arena),
             ingested_files: ArenaVecMap::new_in(arena),
             line_info: arena.alloc(None),

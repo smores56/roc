@@ -2,10 +2,11 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::abilities::SpecializationId;
 use crate::exhaustive::{ExhaustiveContext, SketchedRows};
-use crate::expected::{Expected, PExpected};
-use crate::expr::TryKind;
+// use crate::expected::{Expected, PExpected};
+
+use bumpalo::collections::Vec;
+use bumpalo::Bump;
 use roc_collections::soa::{index_push_new, slice_extend_new};
 use roc_module::ident::{IdentSuffix, TagName};
 use roc_module::symbol::{ModuleId, Symbol};
@@ -14,28 +15,28 @@ use roc_types::subs::{ExhaustiveMark, IllegalCycleMark, Variable};
 use roc_types::types::{Category, PatternCategory, TypeTag, Types};
 use soa::{EitherIndex, Index, Slice};
 
-pub struct Constraints {
-    pub constraints: Vec<Constraint>,
-    pub type_slices: Vec<TypeOrVar>,
-    pub variables: Vec<Variable>,
-    pub loc_symbols: Vec<(Symbol, Region)>,
-    pub let_constraints: Vec<LetConstraint>,
-    pub categories: Vec<Category>,
-    pub pattern_categories: Vec<PatternCategory>,
-    pub expectations: Vec<Expected<TypeOrVar>>,
-    pub pattern_expectations: Vec<PExpected<TypeOrVar>>,
-    pub includes_tags: Vec<IncludesTag>,
-    pub strings: Vec<&'static str>,
-    pub sketched_rows: Vec<SketchedRows>,
-    pub eq: Vec<Eq>,
-    pub pattern_eq: Vec<PatternEq>,
-    pub cycles: Vec<Cycle>,
-    pub fx_call_constraints: Vec<FxCallConstraint>,
-    pub fx_suffix_constraints: Vec<FxSuffixConstraint>,
-    pub try_target_constraints: Vec<TryTargetConstraint>,
+pub struct Constraints<'a> {
+    pub constraints: Vec<'a, Constraint>,
+    pub type_slices: Vec<'a, TypeOrVar>,
+    pub variables: Vec<'a, Variable>,
+    pub loc_symbols: Vec<'a, (Symbol, Region)>,
+    pub let_constraints: Vec<'a, LetConstraint>,
+    pub categories: Vec<'a, Category>,
+    pub pattern_categories: Vec<'a, PatternCategory>,
+    pub expectations: Vec<'a, Expected<TypeOrVar>>,
+    pub pattern_expectations: Vec<'a, PExpected<TypeOrVar>>,
+    pub includes_tags: Vec<'a, IncludesTag>,
+    pub strings: Vec<'a, &'static str>,
+    pub sketched_rows: Vec<'a, SketchedRows>,
+    pub eq: Vec<'a, Eq>,
+    pub pattern_eq: Vec<'a, PatternEq>,
+    pub cycles: Vec<'a, Cycle>,
+    pub fx_call_constraints: Vec<'a, FxCallConstraint>,
+    pub fx_suffix_constraints: Vec<'a, FxSuffixConstraint>,
+    pub try_target_constraints: Vec<'a, TryTargetConstraint>,
 }
 
-impl std::fmt::Debug for Constraints {
+impl<'a> std::fmt::Debug for Constraints<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Constraints")
             .field("constraints", &self.constraints)
@@ -60,36 +61,30 @@ impl std::fmt::Debug for Constraints {
     }
 }
 
-impl Default for Constraints {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub type ExpectedTypeIndex = Index<Expected<TypeOrVar>>;
 pub type PExpectedTypeIndex = Index<PExpected<TypeOrVar>>;
 pub type TypeOrVar = EitherIndex<TypeTag, Variable>;
 
-impl Constraints {
-    pub fn new() -> Self {
-        let constraints = Vec::new();
-        let type_slices = Vec::with_capacity(16);
-        let variables = Vec::new();
-        let loc_symbols = Vec::new();
-        let let_constraints = Vec::new();
-        let mut categories = Vec::with_capacity(16);
-        let mut pattern_categories = Vec::with_capacity(16);
-        let expectations = Vec::new();
-        let pattern_expectations = Vec::new();
-        let includes_tags = Vec::new();
-        let strings = Vec::new();
-        let sketched_rows = Vec::new();
-        let eq = Vec::new();
-        let pattern_eq = Vec::new();
-        let cycles = Vec::new();
-        let fx_call_constraints = Vec::with_capacity(16);
-        let fx_suffix_constraints = Vec::new();
-        let result_type_constraints = Vec::new();
+impl<'a> Constraints<'a> {
+    pub fn new_in(arena: &'a Bump) -> Self {
+        let constraints = Vec::new_in(arena);
+        let type_slices = Vec::with_capacity_in(16, arena);
+        let variables = Vec::new_in(arena);
+        let loc_symbols = Vec::new_in(arena);
+        let let_constraints = Vec::new_in(arena);
+        let mut categories = Vec::with_capacity_in(16, arena);
+        let mut pattern_categories = Vec::with_capacity_in(16, arena);
+        let expectations = Vec::new_in(arena);
+        let pattern_expectations = Vec::new_in(arena);
+        let includes_tags = Vec::new_in(arena);
+        let strings = Vec::new_in(arena);
+        let sketched_rows = Vec::new_in(arena);
+        let eq = Vec::new_in(arena);
+        let pattern_eq = Vec::new_in(arena);
+        let cycles = Vec::new_in(arena);
+        let fx_call_constraints = Vec::with_capacity_in(16, arena);
+        let fx_suffix_constraints = Vec::new_in(arena);
+        let result_type_constraints = Vec::new_in(arena);
 
         categories.extend([
             Category::Record,

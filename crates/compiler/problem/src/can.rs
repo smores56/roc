@@ -72,7 +72,12 @@ pub enum Problem {
     /// First symbol is the name of the closure with that argument
     /// Bool is whether the closure is anonymous
     /// Second symbol is the name of the argument that is unused
-    UnusedArgument(Symbol, bool, Symbol, Region),
+    UnusedArgument {
+        function_symbol: Symbol,
+        is_anonymous: bool,
+        arg_symbol: Symbol,
+        arg_region: Region,
+    },
     UnusedBranchDef(Symbol, Region),
     DefsOnlyUsedInRecursion(usize, Region),
     PrecedenceProblem(PrecedenceProblem),
@@ -297,7 +302,7 @@ impl Problem {
             Problem::DuplicateExposesModule { .. } => Warning,
             Problem::DuplicateRequires { .. } => Warning,
             Problem::DuplicateProvides { .. } => Warning,
-            Problem::UnusedArgument(_, _, _, _) => Warning,
+            Problem::UnusedArgument { .. } => Warning,
             Problem::UnusedBranchDef(_, _) => Warning,
             Problem::PrecedenceProblem(_) => RuntimeError,
             Problem::UnsupportedPattern(_, _) => RuntimeError,
@@ -392,7 +397,9 @@ impl Problem {
             | Problem::ExplicitBuiltinImport(_, region)
             | Problem::ExplicitBuiltinTypeImport(_, region)
             | Problem::ImportShadowsSymbol { region, .. }
-            | Problem::UnusedArgument(_, _, _, region)
+            | Problem::UnusedArgument {
+                arg_region: region, ..
+            }
             | Problem::UnusedBranchDef(_, region)
             | Problem::PrecedenceProblem(PrecedenceProblem::BothNonAssociative(region, _, _))
             | Problem::UnsupportedPattern(_, region)
@@ -648,6 +655,7 @@ pub enum RuntimeError {
         error: io::ErrorKind,
         region: Region,
     },
+    IngestedFilePathIsNotStr(Region),
     InvalidPrecedence(PrecedenceProblem, Region),
     MalformedIdentifier(Box<str>, roc_parse::ident::BadIdent, Region),
     MalformedTypeName(Box<str>, Region),
@@ -690,6 +698,7 @@ pub enum RuntimeError {
     },
 
     NonFunctionHostedAnnotation(Region),
+    CompilerProblem(CompilerProblem, Region),
 }
 
 impl RuntimeError {
@@ -737,8 +746,10 @@ impl RuntimeError {
                 field: region,
             }
             | RuntimeError::ReadIngestedFileError { region, .. }
+            | RuntimeError::IngestedFilePathIsNotStr(region)
             | RuntimeError::InvalidUnicodeCodePt(region)
-            | RuntimeError::NonFunctionHostedAnnotation(region) => *region,
+            | RuntimeError::NonFunctionHostedAnnotation(region)
+            | RuntimeError::CompilerProblem(_, region) => *region,
 
             RuntimeError::UnresolvedTypeVar
             | RuntimeError::ErroneousType
@@ -768,4 +779,51 @@ pub enum MalformedPatternProblem {
     MultipleCharsInSingleQuote,
     DuplicateListRestPattern,
     CantApplyPattern,
+}
+
+/// Problems with the compiler that might arise during canonicalization.
+///
+/// We should always prefer generating compiler problems when a `panic!`
+/// might be used instead. This gets the Roc compiler as close as possible
+/// to never crashing!
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilerProblem {
+    UndesugaredExpr(UndesugaredExprKind),
+    DeprecatedSyntax(DeprecatedSyntaxKind),
+    UnhandledPattern(UnhandledPatternKind),
+}
+
+/// Parse AST expr kinds that should not exist after desugaring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndesugaredExprKind {
+    RecordBuilder,
+    RecordUpdater,
+    TrySuffix,
+    TryKeyword,
+    DbgStmt,
+    SpaceBefore,
+    SpaceAfter,
+    BinOps,
+    UnaryOp,
+    /// An ignored value, e.g. `{ _name: 123 }`
+    IgnoredValueRecordField,
+    /// A label with no value, e.g. `{ name }` (this is sugar for { name: name })
+    LabelOnlyRecordField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnhandledPatternKind {
+    RequiredField,
+    // TODO: stop handling this in this way
+    OptionalField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeprecatedSyntaxKind {
+    /// A constructor for an opaque value, e.g. `@Foo`
+    OpaqueRef,
+    OptionalFieldValue,
+    AbilityDef,
+    AbilityMemberSpecialization,
+    ImportParams,
 }

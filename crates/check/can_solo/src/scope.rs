@@ -9,8 +9,6 @@ use roc_region::all::{Loc, Region};
 use roc_types::subs::Variable;
 use roc_types::types::{EarlyReturnKind, Type};
 
-// use crate::abilities::PendingAbilitiesStore;
-
 use bitvec::vec::BitVec;
 
 use crate::alias::{Alias, AliasKind, AliasVar};
@@ -19,6 +17,15 @@ use crate::module::BuiltinExposedValues;
 
 // ability -> member names
 // pub(crate) type PendingAbilitiesInScope = VecMap<Symbol, VecSet<Symbol>>;
+
+pub struct ShadowOfSymbol {
+    /// The original symbol that was introduced into scope first.
+    pub shadowed_symbol: Symbol,
+    /// The new ident that shadowed the original symbol.
+    pub shadow_ident: Loc<Ident>,
+    /// A new symbol created for the shadow.
+    pub shadow_symbol: Symbol,
+}
 
 #[derive(Debug)]
 pub struct Scope<'a, 's> {
@@ -46,12 +53,13 @@ pub struct Scope<'a, 's> {
     // shadows: VecMap<Symbol, Loc<Symbol>>,
     //
     /// Identifiers that are in scope, and defined in the current module
-    locals: ScopedIdentIds<'a, 's>,
+    pub locals: ScopedIdentIds<'a, 's>,
 
     /// Ignored variables (variables that start with an underscore).
     /// We won't intern them because they're only used during canonicalization for error reporting.
     ignored_locals: ArenaVecMap<'s, String, Region>,
 
+    // TODO: is there a better way to handle these?
     pub early_returns: Vec<'s, (Variable, Region, EarlyReturnKind)>,
 }
 
@@ -81,13 +89,9 @@ impl<'a, 's> Scope<'a, 's> {
         }
     }
 
-    pub fn lookup(&self, ident: &Ident, region: Region) -> Result<SymbolLookup, RuntimeError> {
+    pub fn lookup(&self, ident: &Ident, region: Region) -> Result<Symbol, RuntimeError> {
         self.lookup_str(ident.as_str(), region)
     }
-
-    // pub fn lookup_ability_member_shadow(&self, member: Symbol) -> Option<Symbol> {
-    //     self.shadows.get(&member).map(|loc_shadow| loc_shadow.value)
-    // }
 
     // pub fn add_docs_imports(&mut self) {
     //     self.imported_symbols
@@ -96,7 +100,7 @@ impl<'a, 's> Scope<'a, 's> {
     //         .push(("Set".into(), Symbol::SET_SET, Region::zero()));
     // }
 
-    pub fn lookup_str(&self, ident: &str, region: Region) -> Result<SymbolLookup, RuntimeError> {
+    pub fn lookup_str(&self, ident: &str, region: Region) -> Result<Symbol, RuntimeError> {
         use ContainsIdent::*;
 
         match self.scope_contains_ident(ident) {
@@ -211,14 +215,14 @@ impl<'a, 's> Scope<'a, 's> {
         }
     }
 
-    fn has_imported_symbol(&self, ident: &str) -> Option<(SymbolLookup, Region)> {
+    fn has_imported_symbol(&self, ident: &str) -> Option<(Symbol, Region)> {
         self.imported_symbols
             .iter()
             .find_map(|(import, symbol, original_region)| {
                 if ident == import.as_str() {
                     match self.modules.lookup_by_id(&symbol.module_id()) {
                         Some(module) => Some((module.into_symbol(*symbol), *original_region)),
-                        None => Some((SymbolLookup::no_params(*symbol), *original_region)),
+                        None => Some((*symbol, *original_region)),
                     }
                 } else {
                     None
@@ -322,64 +326,6 @@ impl<'a, 's> Scope<'a, 's> {
         }
     }
 
-    /// Like [Self::introduce], but handles the case of when an ident matches an ability member
-    /// name. In such cases a new symbol is created for the ident (since it's expected to be a
-    /// specialization of the ability member), but the ident is not added to the ident->symbol map.
-    ///
-    /// If the ident does not match an ability name, the behavior of this function is exactly that
-    /// of `introduce`.
-    #[allow(clippy::type_complexity)]
-    pub fn introduce_or_shadow_ability_member(
-        &mut self,
-        pending_abilities_in_scope: &PendingAbilitiesInScope,
-        ident: Ident,
-        region: Region,
-    ) -> Result<(Symbol, Option<Symbol>), (Region, Loc<Ident>, Symbol)> {
-        let ident = &ident;
-
-        match self.introduce_help(ident.as_str(), region) {
-            Err((original_symbol, original_region)) => {
-                let shadow_symbol = self.scopeless_symbol(ident, region);
-
-                if self.abilities_store.is_ability_member_name(original_symbol)
-                    || pending_abilities_in_scope
-                        .iter()
-                        .any(|(_, members)| members.iter().any(|m| *m == original_symbol))
-                {
-                    match self.shadows.get(&original_symbol) {
-                        Some(loc_original_shadow) => {
-                            // Duplicate shadow of an ability members; that's illegal.
-                            let shadow = Loc {
-                                value: ident.clone(),
-                                region,
-                            };
-                            Err((loc_original_shadow.region, shadow, shadow_symbol))
-                        }
-                        None => {
-                            self.shadows
-                                .insert(original_symbol, Loc::at(region, shadow_symbol));
-
-                            Ok((shadow_symbol, Some(original_symbol)))
-                        }
-                    }
-                } else {
-                    // This is an illegal shadow.
-                    let shadow = Loc {
-                        value: ident.clone(),
-                        region,
-                    };
-
-                    Err((original_region, shadow, shadow_symbol))
-                }
-            }
-            Ok(symbol) => Ok((symbol, None)),
-        }
-    }
-
-    pub fn get_member_shadow(&self, ability_member: Symbol) -> Option<&Loc<Symbol>> {
-        self.shadows.get(&ability_member)
-    }
-
     /// Create a new symbol, but don't add it to the scope (yet)
     ///
     /// Used for record guards like { x: Just _ } where the `x` is not added to the scope,
@@ -400,13 +346,7 @@ impl<'a, 's> Scope<'a, 's> {
         region: Region,
     ) -> Result<(), (Symbol, Region)> {
         match self.scope_contains_ident(ident.as_str()) {
-            ContainsIdent::InScope(
-                SymbolLookup {
-                    symbol,
-                    module_params: _,
-                },
-                region,
-            ) => Err((symbol, region)),
+            ContainsIdent::InScope(symbol, region) => Err((symbol, region)),
             ContainsIdent::NotPresent | ContainsIdent::NotInScope(_) => {
                 self.imported_symbols.push((ident, symbol, region));
                 Ok(())
@@ -525,7 +465,7 @@ pub fn create_alias<'a>(
     infer_ext_in_output_variables: Vec<Variable>,
     typ: Type,
     kind: AliasKind,
-) -> Alias {
+) -> Alias<'a> {
     let roc_types::types::VariableDetail {
         type_variables,
         lambda_set_variables,
@@ -568,7 +508,7 @@ pub fn create_alias<'a>(
 
 #[derive(Debug)]
 enum ContainsIdent {
-    InScope(SymbolLookup, Region),
+    InScope(Symbol, Region),
     NotInScope(IdentId),
     NotPresent,
 }
@@ -640,7 +580,7 @@ impl<'a, 's> ScopedIdentIds<'a, 's> {
 
                 if level.in_scope[ident_index] {
                     return ContainsIdent::InScope(
-                        SymbolLookup::no_params(Symbol::new(self.home, ident_id)),
+                        Symbol::new(self.home, ident_id),
                         level.regions[ident_index],
                     );
                 } else {
@@ -722,14 +662,13 @@ impl<'a, 's> ScopedIdentIds<'a, 's> {
 
 #[derive(Debug, Clone)]
 pub struct ScopeModules<'s> {
+    latest_id: ModuleId,
     /// The ids of all modules in scope
     ids: Vec<'s, ModuleId>,
     /// The alias or original name of each module in scope
     names: Vec<'s, ModuleName>,
     /// Why is this module in scope?
     sources: Vec<'s, ScopeModuleSource>,
-    /// The params of a module if any
-    params: Vec<'s, Option<(Variable, Symbol)>>,
 }
 
 impl<'s> ScopeModules<'s> {
@@ -741,7 +680,6 @@ impl<'s> ScopeModules<'s> {
         let mut ids = Vec::with_capacity_in(count + 1, arena);
         let mut names = Vec::with_capacity_in(count + 1, arena);
         let mut sources = vec![in arena; ScopeModuleSource::Builtin; count];
-        let mut params = vec![in arena; None; count];
 
         for (module_id, module_name) in builtins_iter {
             ids.push(module_id);
@@ -752,35 +690,25 @@ impl<'s> ScopeModules<'s> {
             ids.push(home_id);
             names.push(home_name);
             sources.push(ScopeModuleSource::Current);
-            params.push(None);
         }
 
         Self {
+            latest_id: home_id,
             ids,
             names,
             sources,
-            params,
         }
     }
 
-    pub fn lookup(&self, module_name: &ModuleName) -> Option<ModuleLookup> {
+    pub fn lookup(&self, module_name: &ModuleName) -> Option<ModuleId> {
         self.names
             .iter()
             .position(|name| name == module_name)
-            .map(|index| ModuleLookup {
-                id: self.ids[index],
-                params: self.params[index],
-            })
+            .map(|index| self.ids[index])
     }
 
-    pub fn lookup_by_id(&self, module_id: &ModuleId) -> Option<ModuleLookup> {
-        self.ids
-            .iter()
-            .position(|id| id == module_id)
-            .map(|index| ModuleLookup {
-                id: self.ids[index],
-                params: self.params[index],
-            })
+    pub fn contains_id(&self, module_id: &ModuleId) -> bool {
+        self.ids.contains(module_id)
     }
 
     pub fn available_names(&self) -> impl Iterator<Item = &ModuleName> {
@@ -813,6 +741,7 @@ impl<'s> ScopeModules<'s> {
         debug_assert_eq!(self.ids.len(), self.names.len());
         debug_assert_eq!(self.ids.len(), self.sources.len());
         debug_assert_eq!(self.ids.len(), self.params.len());
+
         self.ids.len()
     }
 
@@ -825,41 +754,6 @@ impl<'s> ScopeModules<'s> {
         self.names.truncate(len);
         self.sources.truncate(len);
         self.params.truncate(len);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SymbolLookup {
-    pub symbol: Symbol,
-    pub module_params: Option<(Variable, Symbol)>,
-}
-
-impl SymbolLookup {
-    pub fn new(symbol: Symbol, params: Option<(Variable, Symbol)>) -> Self {
-        Self {
-            symbol,
-            module_params: params,
-        }
-    }
-
-    pub fn no_params(symbol: Symbol) -> Self {
-        Self::new(symbol, None)
-    }
-}
-
-pub struct ModuleLookup {
-    pub id: ModuleId,
-    pub params: Option<(Variable, Symbol)>,
-}
-
-impl ModuleLookup {
-    pub fn into_symbol(&self, symbol: Symbol) -> SymbolLookup {
-        debug_assert_eq!(symbol.module_id(), self.id);
-
-        SymbolLookup {
-            symbol,
-            module_params: self.params,
-        }
     }
 }
 

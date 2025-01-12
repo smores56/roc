@@ -1,18 +1,15 @@
-use crate::alias::AliasKind;
-use crate::alias::AliasVar;
-use crate::annotation::canonicalize_annotation;
+use crate::alias::GeneratedAliasMethod;
+use crate::alias::{Alias, AliasKind, AliasVar};
 use crate::annotation::find_type_def_symbols;
-use crate::annotation::make_apply_symbol;
 use crate::annotation::AnnotationFor;
 use crate::annotation::IntroducedVariables;
-use crate::annotation::OwnedNamedOrAble;
+use crate::annotation::{canonicalize_annotation, OwnedNamedOrWithMethods};
+use crate::declarations::Declarations;
 use crate::env::Env;
-use crate::expr::canonicalize_record;
 use crate::expr::get_lookup_symbols;
 use crate::expr::AnnotatedMark;
 use crate::expr::ClosureData;
-use crate::expr::Declarations;
-use crate::expr::Expr::{self, *};
+use crate::expr::Expr::{self};
 use crate::expr::StructAccessorData;
 use crate::expr::{canonicalize_expr, Output, Recursive};
 use crate::pattern::{canonicalize_def_header_pattern, BindingsFromPattern, Pattern};
@@ -20,7 +17,6 @@ use crate::procedure::QualifiedReference;
 use crate::procedure::References;
 use crate::scope::create_alias;
 use crate::scope::Scope;
-use crate::scope::SymbolLookup;
 use bumpalo::collections::Vec;
 use bumpalo::Bump;
 use roc_collections::ArenaVecMap;
@@ -37,23 +33,18 @@ use roc_module::symbol::IdentId;
 use roc_module::symbol::ModuleId;
 use roc_module::symbol::Symbol;
 use roc_parse::ast;
-use roc_parse::ast::AssignedField;
 use roc_parse::ast::Defs;
 use roc_parse::ast::ExtractSpaces;
 use roc_parse::ast::TypeHeader;
 use roc_parse::ident::Accessor;
 use roc_parse::pattern::PatternType;
-use roc_problem::can::ShadowKind;
+use roc_problem::can::{CompilerProblem, DeprecatedSyntaxKind, ShadowKind};
 use roc_problem::can::{CycleEntry, Problem, RuntimeError};
 use roc_region::all::{Loc, Region};
 use roc_types::subs::IllegalCycleMark;
 use roc_types::subs::{VarStore, Variable};
-use roc_types::types::AliasCommon;
 use roc_types::types::IndexOrField;
-use roc_types::types::LambdaSet;
-use roc_types::types::MemberImpl;
-use roc_types::types::OptAbleType;
-use roc_types::types::{Alias, Type};
+use roc_types::types::Type;
 use std::fmt::Debug;
 use std::fs;
 use std::io::Read;
@@ -124,20 +115,13 @@ impl DefKind {
 pub struct Annotation<'a> {
     pub signature: Type,
     pub introduced_variables: IntroducedVariables<'a>,
-    pub aliases: ArenaVecMap<'a, Symbol, Alias>,
+    pub aliases: ArenaVecMap<'a, Symbol, Alias<'a>>,
     pub region: Region,
 }
 
 impl<'a> Annotation<'a> {
     fn freshen(mut self, var_store: &mut VarStore) -> Self {
         let mut substitutions = MutMap::default();
-
-        for v in self.introduced_variables.lambda_sets.iter_mut() {
-            let new = var_store.fresh();
-            substitutions.insert(*v, new);
-
-            *v = new;
-        }
 
         self.signature.substitute_variables(&substitutions);
 
@@ -169,7 +153,7 @@ pub(crate) struct CanDefs<'a> {
     dbgs: Dbgs<'a>,
     expects: Expects<'a>,
     def_ordering: DefOrdering,
-    aliases: ArenaVecMap<'a, Symbol, Alias>,
+    aliases: ArenaVecMap<'a, Symbol, Alias<'a>>,
 }
 
 #[derive(Clone, Debug)]
@@ -352,7 +336,7 @@ fn canonicalize_alias<'a, 'b>(
     ann: &'a Loc<ast::TypeAnnotation<'a>>,
     vars: &[Loc<Lowercase>],
     kind: AliasKind,
-) -> Result<Alias, ()> {
+) -> Result<Alias<'a>, ()> {
     let symbol = name.value;
     let annotation_for = match kind {
         AliasKind::Structural => AnnotationFor::Alias,
@@ -376,15 +360,17 @@ fn canonicalize_alias<'a, 'b>(
 
     let IntroducedVariables {
         named,
-        able,
-        wildcards,
+        with_methods,
         inferred,
         infer_ext_in_output,
-        ..
     } = can_ann.introduced_variables;
 
-    let mut named: Vec<_> = (named.into_iter().map(OwnedNamedOrAble::Named))
-        .chain(able.into_iter().map(OwnedNamedOrAble::Able))
+    let mut named: Vec<_> = (named.into_iter().map(OwnedNamedOrWithMethods::Named))
+        .chain(
+            with_methods
+                .into_iter()
+                .map(OwnedNamedOrWithMethods::WithMethods),
+        )
         .collect();
     for loc_lowercase in vars.iter() {
         let opt_index = named
@@ -395,14 +381,14 @@ fn canonicalize_alias<'a, 'b>(
                 // This is a valid lowercase rigid var for the type def.
                 let named_variable = named.swap_remove(index);
                 let var = named_variable.variable();
-                let opt_bound_abilities = named_variable.opt_abilities().map(ToOwned::to_owned);
+                let opt_methods = named_variable.opt_methods().map(ToOwned::to_owned);
                 let name = named_variable.name();
 
                 can_vars.push(Loc {
                     value: AliasVar {
                         name,
                         var,
-                        opt_bound_abilities,
+                        opt_methods,
                     },
                     region: loc_lowercase.region,
                 });
@@ -415,16 +401,16 @@ fn canonicalize_alias<'a, 'b>(
                         typ: symbol,
                         variable_region: loc_lowercase.region,
                         variable_name: loc_lowercase.value.clone(),
-                        alias_kind: AliasKind::Structural,
+                        alias_kind: kind,
                     });
                 }
-                AliasKind::Custom => {
+                AliasKind::Custom | AliasKind::Builtin => {
                     // Customs can have phantom types.
                     can_vars.push(Loc {
                         value: AliasVar {
                             name: loc_lowercase.value.clone(),
                             var: var_store.fresh(),
-                            opt_bound_abilities: None,
+                            opt_methods: None,
                         },
                         region: loc_lowercase.region,
                     });
@@ -440,17 +426,6 @@ fn canonicalize_alias<'a, 'b>(
 
     // Report errors for wildcards (*), underscores (_), and named vars that weren't declared.
     let mut no_problems = true;
-
-    if let Some(loc_var) = wildcards.first() {
-        env.problems.push(Problem::WildcardNotAllowed {
-            typ: symbol,
-            num_wildcards: wildcards.len(),
-            one_occurrence: loc_var.region,
-            kind,
-        });
-
-        no_problems = false;
-    }
 
     if let Some(loc_var) = inferred.first() {
         env.problems.push(Problem::UnderscoreNotAllowed {
@@ -474,6 +449,8 @@ fn canonicalize_alias<'a, 'b>(
         no_problems = false;
     }
 
+    // TODO: do I report issues for named_with_methods vars?
+
     if no_problems {
         Ok(create_alias(
             symbol,
@@ -488,440 +465,82 @@ fn canonicalize_alias<'a, 'b>(
     }
 }
 
-#[macro_export]
-macro_rules! params_in_abilities_unimplemented {
-    ($lookup:expr) => {
-        match $lookup.module_params {
-            None => $lookup.symbol,
-            Some(_) => unimplemented!("params in abilities"),
-        }
-    };
-}
-
-/// Canonicalizes a claimed ability implementation like `{ eq }` or `{ eq: myEq }`.
-/// Returns a mapping of the ability member to the implementation symbol.
-/// If there was an error, a problem will be recorded and nothing is returned.
-fn canonicalize_claimed_ability_impl<'a>(
-    env: &mut Env<'a>,
-    scope: &mut Scope,
-    ability: Symbol,
-    loc_impl: &Loc<ast::AssignedField<'a, ast::Expr<'a>>>,
-) -> Result<(Symbol, Symbol), ()> {
-    let ability_home = ability.module_id();
-
-    match loc_impl.extract_spaces().item {
-        AssignedField::LabelOnly(label) => {
-            let label_str = label.value;
-            let region = label.region;
-
-            let member_symbol =
-                match env.qualified_lookup_with_module_id(scope, ability_home, label_str, region) {
-                    Ok(lookup) => params_in_abilities_unimplemented!(lookup),
-                    Err(_) => {
-                        env.problem(Problem::NotAnAbilityMember {
-                            ability,
-                            name: label_str.to_owned(),
-                            region,
-                        });
-
-                        return Err(());
-                    }
-                };
-
-            // There are two options for how the implementation symbol is defined.
-            //
-            // OPTION-1: The implementation identifier is the only identifier of that name in the
-            //           scope. For example,
-            //
-            //               module []
-            //
-            //               Hello := {} implements [Encoding.{ toEncoder }]
-            //
-            //               toEncoder = \@Hello {} -> ...
-            //
-            //           In this case, we just do a simple lookup in the scope to find our
-            //           `toEncoder` impl.
-            //
-            // OPTION-2: The implementation identifier is a unique shadow of the ability member,
-            //           which has also been explicitly imported. For example,
-            //
-            //               module []
-            //
-            //               import Encoding exposing [toEncoder]
-            //
-            //               Hello := {} implements [Encoding.{ toEncoder }]
-            //
-            //               toEncoder = \@Hello {} -> ...
-            //
-            //           In this case, we allow the `F` module's `toEncoder` def to shadow
-            //           `toEncoder` only to define this specialization's `toEncoder`.
-            //
-            // To handle both cases, try checking for a shadow first, then check for a direct
-            // reference. We want to check for a direct reference second so that if there is a
-            // shadow, we won't accidentally grab the imported symbol.
-            let opt_impl_symbol =
-                (scope.lookup_ability_member_shadow(member_symbol)).or_else(|| {
-                    scope
-                        .lookup_str(label_str, region)
-                        .map(|s| params_in_abilities_unimplemented!(s))
-                        .ok()
-                });
-
-            match opt_impl_symbol {
-                // It's possible that even if we find a symbol it is still only the member
-                // definition symbol, for example when the ability is defined in the same
-                // module as an implementer:
-                //
-                //   Eq implements eq : a, a -> U64 where a implements Eq
-                //
-                //   A := U8 implements [Eq {eq}]
-                //
-                // So, do a final check that the implementation symbol is not resolved directly
-                // to the member.
-                Some(impl_symbol) if impl_symbol != member_symbol => {
-                    Ok((member_symbol, impl_symbol))
-                }
-                _ => {
-                    env.problem(Problem::ImplementationNotFound {
-                        member: member_symbol,
-                        region: label.region,
-                    });
-                    Err(())
-                }
-            }
-        }
-        AssignedField::RequiredValue(label, _spaces, value) => {
-            let impl_ident = match value.value {
-                ast::Expr::Var { module_name, ident } => {
-                    if module_name.is_empty() {
-                        ident
-                    } else {
-                        env.problem(Problem::QualifiedAbilityImpl {
-                            region: value.region,
-                        });
-                        return Err(());
-                    }
-                }
-                _ => {
-                    env.problem(Problem::AbilityImplNotIdent {
-                        region: value.region,
-                    });
-                    return Err(());
-                }
-            };
-            let impl_region = value.region;
-
-            let member_symbol = match env.qualified_lookup_with_module_id(
-                scope,
-                ability_home,
-                label.value,
-                label.region,
-            ) {
-                Ok(lookup) => params_in_abilities_unimplemented!(lookup),
-                Err(_) => {
-                    env.problem(Problem::NotAnAbilityMember {
-                        ability,
-                        name: label.value.to_owned(),
-                        region: label.region,
-                    });
-                    return Err(());
-                }
-            };
-
-            let impl_symbol = match scope.lookup(&impl_ident.into(), impl_region) {
-                Ok(symbol) => params_in_abilities_unimplemented!(symbol),
-                Err(err) => {
-                    env.problem(Problem::RuntimeError(err));
-                    return Err(());
-                }
-            };
-
-            Ok((member_symbol, impl_symbol))
-        }
-        AssignedField::OptionalValue(_, _, _) => {
-            env.problem(Problem::OptionalAbilityImpl {
-                ability,
-                region: loc_impl.region,
-            });
-            Err(())
-        }
-        AssignedField::SpaceBefore(_, _)
-        | AssignedField::SpaceAfter(_, _)
-        | AssignedField::IgnoredValue(_, _, _) => {
-            internal_error!("unreachable")
-        }
-    }
-}
-
-struct SeparatedMembers {
-    not_required: Vec<Symbol>,
-    not_implemented: Vec<Symbol>,
-}
-
-/// Partitions ability members in a `has [ Ability {...members} ]` clause into the members the
-/// opaque type claims to implement but are not part of the ability, and the ones it does not
-/// implement.
-fn separate_implemented_and_required_members(
-    implemented: VecSet<Symbol>,
-    required: VecSet<Symbol>,
-) -> SeparatedMembers {
-    use std::cmp::Ordering;
-
-    let mut implemented = implemented.into_vec();
-    let mut required = required.into_vec();
-
-    implemented.sort();
-    required.sort();
-
-    let mut implemented = implemented.into_iter().peekable();
-    let mut required = required.into_iter().peekable();
-
-    let mut not_required = vec![];
-    let mut not_implemented = vec![];
-
-    loop {
-        // Equal => both required and implemented
-        // Less => implemented but not required
-        // Greater => required but not implemented
-
-        let ord = match (implemented.peek(), required.peek()) {
-            (Some(implemented), Some(required)) => Some(implemented.cmp(required)),
-            (Some(_), None) => Some(Ordering::Less),
-            (None, Some(_)) => Some(Ordering::Greater),
-            (None, None) => None,
-        };
-
-        match ord {
-            Some(Ordering::Less) => {
-                not_required.push(implemented.next().unwrap());
-            }
-            Some(Ordering::Greater) => {
-                not_implemented.push(required.next().unwrap());
-            }
-            Some(Ordering::Equal) => {
-                _ = implemented.next().unwrap();
-                _ = required.next().unwrap();
-            }
-            None => break,
-        }
-    }
-
-    SeparatedMembers {
-        not_required,
-        not_implemented,
-    }
-}
-
 type DerivedDef<'a> = Loc<PendingValue<'a>>;
 
-struct CanonicalizedOpaque<'a> {
-    opaque_def: Alias,
-    derived_defs: Vec<DerivedDef<'a>>,
+struct CanonicalizedCustom<'a> {
+    custom_def: Alias<'a>,
+    derived_defs: Vec<'a, DerivedDef<'a>>,
 }
 
+// TODO: remove clippy ignore
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn canonicalize_opaque<'a>(
-    env: &mut Env<'a>,
+fn canonicalize_custom<'a, 's, 'b>(
+    env: &mut Env<'a, 'b>,
     output: &mut Output,
     var_store: &mut VarStore,
-    scope: &mut Scope,
-    pending_abilities_in_scope: &PendingAbilitiesInScope,
+    scope: &mut Scope<'a, 's>,
 
     name: Loc<Symbol>,
     name_str: &'a str,
     ann: &'a Loc<ast::TypeAnnotation<'a>>,
     vars: &[Loc<Lowercase>],
-    has_abilities: Option<&'a Loc<ast::ImplementsAbilities<'a>>>,
-) -> Result<CanonicalizedOpaque<'a>, ()> {
+    methods_to_generate: Option<&'a [Loc<GeneratedAliasMethod>]>,
+) -> Result<CanonicalizedCustom<'a>, ()> {
     let alias = canonicalize_alias(
         env,
         output,
         var_store,
         scope,
-        pending_abilities_in_scope,
         name,
         ann,
         vars,
-        AliasKind::Opaque,
+        AliasKind::Custom,
     )?;
 
     let mut references = References::new();
 
     let mut derived_defs = Vec::new();
-    if let Some(has_abilities) = has_abilities {
-        let has_abilities = has_abilities.value.collection();
+    if let Some(methods_to_gen) = methods_to_generate {
+        let mut generated_methods = vec![];
 
-        let mut derived_abilities = vec![];
+        // for method_to_gen in methods_to_gen.items {
+        //     let region = method_to_gen.region;
 
-        for has_ability in has_abilities.items {
-            let region = has_ability.region;
-            let (ability, opt_impls) = match has_ability.value.extract_spaces().item {
-                ast::ImplementsAbility::ImplementsAbility { ability, impls } => (ability, impls),
-                _ => internal_error!("spaces not extracted"),
-            };
+        //     // Op := {} has [Eq]
 
-            let ability_region = ability.region;
+        //            .register_declared_implementations(name.value, impls);
+        //     } else if let Some((_, members)) = ability.derivable_ability() {
+        //         let num_members = members.len();
 
-            // Op := {} has [Eq]
-            let (ability, members) = match ability.value {
-                ast::TypeAnnotation::Apply(module_name, ident, []) => {
-                    match make_apply_symbol(env, region, scope, module_name, ident, &mut references)
-                    {
-                        Ok(ability) => {
-                            let opt_members = scope
-                                .abilities_store
-                                .members_of_ability(ability)
-                                .map(|members| members.iter().copied().collect())
-                                .or_else(|| pending_abilities_in_scope.get(&ability).cloned());
+        //         derived_defs.reserve(num_members);
 
-                            if let Some(members) = opt_members {
-                                // This is an ability we already imported into the scope,
-                                // or which is also undergoing canonicalization at the moment.
-                                (ability, members)
-                            } else {
-                                env.problem(Problem::NotAnAbility(ability_region));
-                                continue;
-                            }
-                        }
-                        Err(_) => {
-                            // This is bad apply; an error will have been reported for it
-                            // already.
-                            continue;
-                        }
-                    }
-                }
-                _ => {
-                    // Register the problem but keep going.
-                    env.problem(Problem::NotAnAbility(ability_region));
-                    continue;
-                }
-            };
+        //         let mut impls = Vec::with_capacity(num_members);
+        //         for &member in members.iter() {
+        //             let (derived_impl, impl_pat, impl_body) =
+        //                 derive::synthesize_member_impl(env, scope, name_str, member);
 
-            if let Some(impls) = opt_impls {
-                let mut impl_map: VecMap<Symbol, Loc<MemberImpl>> = VecMap::default();
+        //             let derived_def = Loc::at(
+        //                 derive::DERIVED_REGION,
+        //                 PendingValue::Def(PendingValueDef::Body(impl_pat, impl_body)),
+        //             );
 
-                // First up canonicalize all the claimed implementations, building a map of ability
-                // member -> implementation.
-                for loc_impl in impls.extract_spaces().item.items {
-                    let (member, impl_symbol) =
-                        match canonicalize_claimed_ability_impl(env, scope, ability, loc_impl) {
-                            Ok((member, impl_symbol)) => (member, impl_symbol),
-                            Err(()) => continue,
-                        };
+        //             impls.push((member, MemberImpl::Impl(derived_impl)));
+        //             derived_defs.push(derived_def);
+        //         }
 
-                    // Did the user claim this implementation for a specialization of a different
-                    // type? e.g.
-                    //
-                    //   A implements [Hash {hash: myHash}]
-                    //   B implements [Hash {hash: myHash}]
-                    //
-                    // If so, that's an error and we drop the impl for this opaque type.
-                    let member_impl = match scope.abilities_store.impl_key(impl_symbol) {
-                        Some(ImplKey {
-                            opaque,
-                            ability_member,
-                        }) => {
-                            env.problem(Problem::OverloadedSpecialization {
-                                overload: loc_impl.region,
-                                original_opaque: *opaque,
-                                ability_member: *ability_member,
-                            });
-                            MemberImpl::Error
-                        }
-                        None => MemberImpl::Impl(impl_symbol),
-                    };
+        //         scope
+        //             .abilities_store
+        //             .register_declared_implementations(name.value, impls);
 
-                    // Did the user already claim an implementation for the ability member for this
-                    // type previously? (e.g. Hash {hash: hash1, hash: hash2})
-                    let opt_old_impl_symbol =
-                        impl_map.insert(member, Loc::at(loc_impl.region, member_impl));
-
-                    if let Some(old_impl_symbol) = opt_old_impl_symbol {
-                        env.problem(Problem::DuplicateImpl {
-                            original: old_impl_symbol.region,
-                            duplicate: loc_impl.region,
-                        });
-                    }
-                }
-
-                // Check that the members this opaque claims to implement corresponds 1-to-1 with
-                // the members the ability offers.
-                let SeparatedMembers {
-                    not_required,
-                    not_implemented,
-                } = separate_implemented_and_required_members(
-                    impl_map.iter().map(|(member, _)| *member).collect(),
-                    members,
-                );
-
-                if !not_required.is_empty() {
-                    // Implementing something that's not required is a recoverable error, we don't
-                    // need to skip association of the implemented abilities. Just remove the
-                    // unneeded members.
-                    for sym in not_required.iter() {
-                        impl_map.remove(sym);
-                    }
-
-                    env.problem(Problem::ImplementsNonRequired {
-                        region,
-                        ability,
-                        not_required,
-                    });
-                }
-
-                if !not_implemented.is_empty() {
-                    // We'll generate runtime errors for the members that are needed but
-                    // unspecified.
-                    for sym in not_implemented.iter() {
-                        impl_map.insert(*sym, Loc::at_zero(MemberImpl::Error));
-                    }
-
-                    env.problem(Problem::DoesNotImplementAbility {
-                        region,
-                        ability,
-                        not_implemented,
-                    });
-                }
-
-                let impls = impl_map
-                    .into_iter()
-                    .map(|(member, def)| (member, def.value));
-
-                scope
-                    .abilities_store
-                    .register_declared_implementations(name.value, impls);
-            } else if let Some((_, members)) = ability.derivable_ability() {
-                let num_members = members.len();
-
-                derived_defs.reserve(num_members);
-
-                let mut impls = Vec::with_capacity(num_members);
-                for &member in members.iter() {
-                    let (derived_impl, impl_pat, impl_body) =
-                        derive::synthesize_member_impl(env, scope, name_str, member);
-
-                    let derived_def = Loc::at(
-                        derive::DERIVED_REGION,
-                        PendingValue::Def(PendingValueDef::Body(impl_pat, impl_body)),
-                    );
-
-                    impls.push((member, MemberImpl::Impl(derived_impl)));
-                    derived_defs.push(derived_def);
-                }
-
-                scope
-                    .abilities_store
-                    .register_declared_implementations(name.value, impls);
-
-                derived_abilities.push(Loc::at(ability_region, ability));
-            } else {
-                // There was no record specified of functions to use for
-                // members, but also this isn't a builtin ability, so we don't
-                // know how to auto-derive it.
-                env.problem(Problem::IllegalDerivedAbility(region));
-            }
-        }
+        //         derived_abilities.push(Loc::at(ability_region, ability));
+        //     } else {
+        //         // There was no record specified of functions to use for
+        //         // members, but also this isn't a builtin ability, so we don't
+        //         // know how to auto-derive it.
+        //         env.problem(Problem::IllegalDerivedAbility(region));
+        //     }
+        // }
 
         if !derived_abilities.is_empty() {
             // Fresh instance of this opaque to be checked for derivability during solving.
@@ -977,10 +596,10 @@ pub(crate) fn canonicalize_defs<'a, 's, 'b>(
     loc_defs: &'a mut roc_parse::ast::Defs<'a>,
     pattern_type: PatternType,
 ) -> (
-    CanDefs,
-    Output,
+    CanDefs<'a>,
+    Output<'a>,
     MutMap<Symbol, Region>,
-    Vec<IntroducedImport>,
+    Vec<'a, IntroducedImport<'a>>,
 ) {
     // Canonicalizing defs while detecting shadowing involves a multi-step process:
     //
@@ -988,7 +607,7 @@ pub(crate) fn canonicalize_defs<'a, 's, 'b>(
     // 2. For each identifier pattern, get the scope.symbol() for the ident. (That symbol will use the home module for its module.)
     // 3. If that symbol is already in scope, then we're about to shadow it. Error!
     // 4. Otherwise, add it to the scope immediately, so we can detect shadowing within the same
-    //    pattern (e.g. (Foo a a) = ...)
+    //    pattern (e.g. Foo(a, a) = ...)
     // 5. Add this canonicalized pattern and its corresponding ast::Expr to pending_exprs.
     // 5. Once every pattern has been processed and added to scope, go back and canonicalize the exprs from
     //    pending_exprs, this time building up a canonical def for each one.
@@ -1032,7 +651,6 @@ pub(crate) fn canonicalize_defs<'a, 's, 'b>(
                 value_def,
                 region,
                 scope,
-                &pending_abilities_in_scope,
                 &mut output,
                 pattern_type,
             );
@@ -1049,14 +667,7 @@ pub(crate) fn canonicalize_defs<'a, 's, 'b>(
         aliases,
         symbols_introduced,
         derived_defs,
-    } = canonicalize_type_defs(
-        env,
-        &mut output,
-        var_store,
-        scope,
-        &pending_abilities_in_scope,
-        pending_type_defs,
-    );
+    } = canonicalize_type_defs(env, &mut output, var_store, scope, pending_type_defs);
 
     // Add the derived ASTs, so that we create proper canonicalized defs for them.
     // They can go at the end, and derived defs should never reference anything other than builtin
@@ -1113,7 +724,12 @@ fn canonicalize_value_defs<'a, 'b>(
             }
             PendingValue::SignatureDefMismatch => { /* skip */ }
             PendingValue::Dbg(pending_dbg) => {
-                pending_dbgs.push(pending_dbg);
+                if pattern_type == PatternType::TopLevelDef {
+                    env.problems
+                        .push(Problem::TopLevelDbg(loc_pending_def.region));
+                } else {
+                    pending_dbgs.push(pending_dbg);
+                }
             }
             PendingValue::Expect(pending_expect) => {
                 pending_expects.push(pending_expect);
@@ -1122,29 +738,20 @@ fn canonicalize_value_defs<'a, 'b>(
                 module_id,
                 region,
                 exposed_symbols,
-                params,
             }) => {
                 imports_introduced.push(IntroducedImport {
                     module_id,
                     region,
                     exposed_symbols,
                 });
-
-                pending_value_defs.push(PendingValueDef::ImportParams {
-                    symbol: params.symbol,
-                    variable: params.variable,
-                    loc_pattern: params.loc_pattern,
-                    opt_provided: params.opt_provided,
-                    module_id,
-                });
             }
             PendingValue::InvalidIngestedFile => { /* skip */ }
             PendingValue::ImportNameConflict => { /* skip */ }
-            PendingValue::StmtAfterExpr => { /* skip */ }
         }
     }
 
-    let mut symbol_to_index: Vec<(IdentId, u32)> = Vec::with_capacity(pending_value_defs.len());
+    let mut symbol_to_index: ArenaVecMap<'a, IdentId, u32> =
+        ArenaVecMap::with_capacity_in(pending_value_defs.len(), env.arena);
 
     for (def_index, pending_def) in pending_value_defs.iter().enumerate() {
         let Some(loc_pattern) = pending_def.loc_pattern() else {
@@ -1201,8 +808,8 @@ fn canonicalize_value_defs<'a, 'b>(
         def_ordering.insert_symbol_references(def_id as u32, &temp_output.references)
     }
 
-    let mut dbgs = ExpectsOrDbgs::with_capacity(pending_dbgs.len());
-    let mut expects = ExpectsOrDbgs::with_capacity(pending_expects.len());
+    let mut dbgs = Dbgs::with_capacity_in(pending_dbgs.len(), env.arena);
+    let mut expects = Expects::with_capacity_in(pending_expects.len(), env.arena);
 
     for pending in pending_dbgs {
         let (loc_can_condition, can_output) = canonicalize_expr(
@@ -1213,7 +820,7 @@ fn canonicalize_value_defs<'a, 'b>(
             &pending.condition.value,
         );
 
-        dbgs.push(loc_can_condition, pending.preceding_comment);
+        dbgs.push(loc_can_condition);
 
         output.union(can_output);
     }
@@ -1244,22 +851,21 @@ fn canonicalize_value_defs<'a, 'b>(
 }
 
 struct CanonicalizedTypeDefs<'a> {
-    aliases: VecMap<Symbol, Alias>,
+    aliases: VecMap<Symbol, Alias<'a>>,
     symbols_introduced: MutMap<Symbol, Region>,
-    derived_defs: Vec<DerivedDef<'a>>,
+    derived_defs: Vec<'a, DerivedDef<'a>>,
 }
 
-fn canonicalize_type_defs<'a>(
-    env: &mut Env<'a>,
+fn canonicalize_type_defs<'a, 'b>(
+    env: &mut Env<'a, 'b>,
     output: &mut Output,
     var_store: &mut VarStore,
     scope: &mut Scope,
-    pending_abilities_in_scope: &PendingAbilitiesInScope,
     pending_type_defs: Vec<PendingTypeDef<'a>>,
 ) -> CanonicalizedTypeDefs<'a> {
     struct AliasDef<'a> {
         name: Loc<Symbol>,
-        var_names: Vec<Loc<Lowercase>>,
+        var_names: Vec<'a, Loc<Lowercase>>,
         typ: &'a Loc<ast::TypeAnnotation<'a>>,
         kind: AliasKind,
     }
@@ -1276,8 +882,13 @@ fn canonicalize_type_defs<'a>(
         }
 
         match pending_def {
-            PendingTypeDef::Alias { name, vars, ann } => {
-                let referenced_symbols = find_type_def_symbols(scope, &ann.value);
+            PendingTypeDef::Alias {
+                name,
+                vars,
+                ann,
+                kind,
+            } => {
+                let referenced_symbols = find_type_def_symbols(scope, &ann.value, &env.arena);
 
                 referenced_type_symbols.insert(name.value, referenced_symbols);
 
@@ -1298,7 +909,7 @@ fn canonicalize_type_defs<'a>(
                 ann,
                 derived,
             } => {
-                let referenced_symbols = find_type_def_symbols(scope, &ann.value);
+                let referenced_symbols = find_type_def_symbols(scope, &ann.value, &env.arena);
 
                 referenced_type_symbols.insert(name.value, referenced_symbols);
                 // Don't need to insert references for derived types, because these can only contain
@@ -1328,13 +939,12 @@ fn canonicalize_type_defs<'a>(
 
     for type_name in sorted {
         match type_defs.remove(&type_name).unwrap() {
-            TypeDef::Alias(name, vars, ann) => {
+            ast::TypeDef::Alias(name, vars, ann) => {
                 let alias = canonicalize_alias(
                     env,
                     output,
                     var_store,
                     scope,
-                    pending_abilities_in_scope,
                     name,
                     ann,
                     &vars,
@@ -1346,18 +956,9 @@ fn canonicalize_type_defs<'a>(
                 }
             }
 
-            TypeDef::Opaque(name_str, name, vars, ann, derived) => {
-                let alias_and_derives = canonicalize_opaque(
-                    env,
-                    output,
-                    var_store,
-                    scope,
-                    pending_abilities_in_scope,
-                    name,
-                    name_str,
-                    ann,
-                    &vars,
-                    derived,
+            ast::TypeDef::Opaque(name_str, name, vars, ann, derived) => {
+                let alias_and_derives = canonicalize_custom(
+                    env, output, var_store, scope, name, name_str, ann, &vars, derived,
                 );
 
                 if let Ok(CanonicalizedOpaque {
@@ -1370,10 +971,16 @@ fn canonicalize_type_defs<'a>(
                 }
             }
 
-            TypeDef::Ability(name, members) => {
-                // For now we enforce that aliases cannot reference abilities, so let's wait to
-                // resolve ability definitions until aliases are resolved and in scope below.
-                abilities.insert(name.value, members);
+            ast::TypeDef::Ability {
+                header,
+                loc_implements,
+                members,
+            } => {
+                env.problems
+                    .push(Problem::RuntimeError(RuntimeError::CompilerProblem(
+                        CompilerProblem::DeprecatedSyntax(DeprecatedSyntaxKind::AbilityDef),
+                        name,
+                    )));
             }
         }
     }
@@ -1393,16 +1000,6 @@ fn canonicalize_type_defs<'a>(
         );
     }
 
-    // Resolve all pending abilities, to add them to scope.
-    resolve_abilities(
-        env,
-        output,
-        var_store,
-        scope,
-        abilities,
-        pending_abilities_in_scope,
-    );
-
     CanonicalizedTypeDefs {
         aliases,
         symbols_introduced,
@@ -1410,131 +1007,10 @@ fn canonicalize_type_defs<'a>(
     }
 }
 
-/// Resolve all pending abilities, to add them to scope.
-#[allow(clippy::too_many_arguments)]
-fn resolve_abilities(
-    env: &mut Env,
-    output: &mut Output,
-    var_store: &mut VarStore,
-    scope: &mut Scope,
-    abilities: MutMap<Symbol, Vec<PendingAbilityMember>>,
-    pending_abilities_in_scope: &PendingAbilitiesInScope,
-) {
-    for (ability, members) in abilities {
-        let mut can_members = Vec::with_capacity(members.len());
-
-        for PendingAbilityMember {
-            name:
-                Loc {
-                    value: member_sym,
-                    region: member_name_region,
-                },
-            typ,
-        } in members
-        {
-            let member_annot = canonicalize_annotation(
-                env,
-                scope,
-                &typ.value,
-                typ.region,
-                var_store,
-                pending_abilities_in_scope,
-                AnnotationFor::Value,
-            );
-
-            // Record all the annotation's references in output.references.lookups
-            output.references.union_mut(&member_annot.references);
-
-            // What variables in the annotation are bound to the parent ability, and what variables
-            // are bound to some other ability?
-            let (variables_bound_to_ability, _variables_bound_to_other_abilities): (
-                Vec<_>,
-                Vec<_>,
-            ) = member_annot
-                .introduced_variables
-                .able
-                .iter()
-                .partition(|av| av.abilities.contains(&ability));
-
-            let var_bound_to_ability = match variables_bound_to_ability.as_slice() {
-                [one] => one.variable,
-                [] => {
-                    // There are no variables bound to the parent ability - then this member doesn't
-                    // need to be a part of the ability.
-                    env.problem(Problem::AbilityMemberMissingImplementsClause {
-                        member: member_sym,
-                        ability,
-                        region: member_name_region,
-                    });
-                    // Pretend the member isn't a part of the ability
-                    continue;
-                }
-                [..] => {
-                    // There is more than one variable bound to the member signature, so something like
-                    //   Eq implements eq : a, b -> Bool where a implements Eq, b implements Eq
-                    // We have no way of telling what type implements a particular instance of Eq in
-                    // this case (a or b?), so disallow it.
-                    let span_has_clauses = Region::across_all(
-                        variables_bound_to_ability.iter().map(|v| &v.first_seen),
-                    );
-                    let bound_var_names = variables_bound_to_ability
-                        .iter()
-                        .map(|v| v.name.clone())
-                        .collect();
-                    env.problem(Problem::AbilityMemberMultipleBoundVars {
-                        member: member_sym,
-                        ability,
-                        span_implements_clauses: span_has_clauses,
-                        bound_var_names,
-                    });
-                    // Pretend the member isn't a part of the ability
-                    continue;
-                }
-            };
-
-            // The introduced variables are good; add them to the output.
-            output
-                .introduced_variables
-                .union(&member_annot.introduced_variables);
-
-            let iv = member_annot.introduced_variables;
-
-            let variables = MemberVariables {
-                able_vars: iv.collect_able(),
-                rigid_vars: iv.collect_rigid(),
-                flex_vars: iv.collect_flex(),
-            };
-
-            let signature = {
-                let mut signature = member_annot.typ;
-                signature
-                    .instantiate_lambda_sets_as_unspecialized(var_bound_to_ability, member_sym);
-                signature
-            };
-
-            can_members.push((
-                member_sym,
-                AbilityMemberData {
-                    parent_ability: ability,
-                    region: member_name_region,
-                    typ: PendingMemberType::Local {
-                        variables,
-                        signature,
-                        signature_var: var_store.fresh(),
-                    },
-                },
-            ));
-        }
-
-        // Store what symbols a type must define implementations for to have this ability.
-        scope.abilities_store.register_ability(ability, can_members);
-    }
-}
-
 #[derive(Debug)]
-struct DefOrdering {
+struct DefOrdering<'a> {
     home: ModuleId,
-    symbol_to_id: Vec<(IdentId, u32)>,
+    symbol_to_id: ArenaVecMap<'a, IdentId, u32>,
 
     // an length x length matrix indicating who references who
     references: ReferenceMatrix,
@@ -1544,7 +1020,7 @@ struct DefOrdering {
     direct_references: ReferenceMatrix,
 }
 
-impl DefOrdering {
+impl<'a> DefOrdering<'a> {
     fn from_symbol_to_id(
         home: ModuleId,
         symbol_to_id: Vec<(IdentId, u32)>,
@@ -1627,7 +1103,7 @@ pub(crate) fn sort_top_level_can_defs<'a, 'b>(
     defs: CanDefs,
     mut output: Output,
     exposed_symbols: &VecSet<Symbol>,
-) -> (Declarations, Output) {
+) -> (Declarations<'a>, Output<'a>) {
     let CanDefs {
         defs,
         dbgs: _,
@@ -1711,7 +1187,7 @@ pub(crate) fn sort_top_level_can_defs<'a, 'b>(
                     }
 
                     match def.loc_expr.value {
-                        Closure(closure_data) => {
+                        Expr::Closure(closure_data) => {
                             declarations.push_recursive_def(
                                 Loc::at(def.loc_pattern.region, symbol),
                                 Loc::at(def.loc_expr.region, closure_data),
@@ -1744,7 +1220,7 @@ pub(crate) fn sort_top_level_can_defs<'a, 'b>(
                             };
 
                             match def.loc_expr.value {
-                                Closure(closure_data) => {
+                                Expr::Closure(closure_data) => {
                                     declarations.push_function_def(
                                         Loc::at(def.loc_pattern.region, symbol),
                                         Loc::at(def.loc_expr.region, closure_data),
@@ -1770,36 +1246,14 @@ pub(crate) fn sort_top_level_can_defs<'a, 'b>(
                             ident: symbol,
                             specializes,
                         } => {
-                            let host_annotation = if exposed_symbols.contains(&symbol) {
-                                def.annotation
-                                    .clone()
-                                    .map(|a| (var_store.fresh(), a.freshen(var_store)))
-                            } else {
-                                None
-                            };
-
-                            match def.loc_expr.value {
-                                Closure(closure_data) => {
-                                    declarations.push_function_def(
-                                        Loc::at(def.loc_pattern.region, symbol),
-                                        Loc::at(def.loc_expr.region, closure_data),
-                                        def.expr_var,
-                                        def.annotation,
-                                        host_annotation,
-                                        Some(specializes),
-                                    );
-                                }
-                                _ => {
-                                    declarations.push_value_def(
-                                        Loc::at(def.loc_pattern.region, symbol),
-                                        def.loc_expr,
-                                        def.expr_var,
-                                        def.annotation,
-                                        host_annotation,
-                                        Some(specializes),
-                                    );
-                                }
-                            }
+                            env.problems.push(Problem::RuntimeError(
+                                RuntimeError::CompilerProblem(
+                                    CompilerProblem::DeprecatedSyntax(
+                                        DeprecatedSyntaxKind::AbilityMemberSpecialization,
+                                    ),
+                                    def.loc_pattern.region,
+                                ),
+                            ));
                         }
                         _ => {
                             declarations.push_destructure_def(
@@ -2194,7 +1648,7 @@ fn canonicalize_pending_value_def<'a>(
     // All abilities should be resolved by the time we're canonicalizing value defs.
     let pending_abilities_in_scope = &Default::default();
 
-    let output = match pending_def {
+    match pending_def {
         AnnotationOnly(loc_can_pattern, loc_ann) => {
             // Make types for the body expr, even if we won't end up having a body.
             let expr_var = var_store.fresh();
@@ -2208,7 +1662,6 @@ fn canonicalize_pending_value_def<'a>(
                 &loc_ann.value,
                 loc_ann.region,
                 var_store,
-                pending_abilities_in_scope,
                 AnnotationFor::Value,
             );
 
@@ -2223,6 +1676,7 @@ fn canonicalize_pending_value_def<'a>(
 
             let arity = type_annotation.typ.arity();
 
+            // TODO: surface this problem!
             let problem = match &loc_can_pattern.value {
                 Pattern::Identifier(symbol) => RuntimeError::NoImplementationNamed {
                     def_symbol: *symbol,
@@ -2274,15 +1728,13 @@ fn canonicalize_pending_value_def<'a>(
                 Loc {
                     value: Closure(ClosureData {
                         function_type: var_store.fresh(),
-                        closure_type: var_store.fresh(),
                         return_type: var_store.fresh(),
                         fx_type: var_store.fresh(),
-                        early_returns: scope.early_returns.clone(),
+                        early_returns: scope.early_returns.into_bump_slice(),
                         name: symbol,
-                        captured_symbols: Vec::new(),
                         recursive: Recursive::NotRecursive,
                         arguments: underscores,
-                        loc_body: Box::new(body_expr),
+                        loc_body: env.arena.alloc(body_expr),
                     }),
                     region: loc_ann.region,
                 }
@@ -2311,7 +1763,6 @@ fn canonicalize_pending_value_def<'a>(
                 &loc_ann.value,
                 loc_ann.region,
                 var_store,
-                pending_abilities_in_scope,
                 AnnotationFor::Value,
             );
 
@@ -2361,86 +1812,24 @@ fn canonicalize_pending_value_def<'a>(
                 DefKind::Stmt(fx_var),
             )
         }
-        ImportParams {
-            symbol,
-            variable,
-            loc_pattern,
-            module_id,
-            opt_provided,
+        IngestedFile {
+            pattern,
+            annotation,
+            filepath,
         } => {
-            // Insert a reference to the record so that we don't report it as unused
-            // If the whole module is unused, we'll report that separately
-            output.references.insert_value_lookup(
-                SymbolLookup::no_params(symbol),
-                QualifiedReference::Unqualified,
-            );
+            // TODO: create RuntimeError here
+            let loc_expr = if let ast::StrLiteral::PlainLine(ingested_path) = filepath.value {
+                env.ingested_files.
+                Expr::DelayedIngestedFile
+            } else {
+                let runtime_error = RuntimeError::IngestedFilePathIsNotStr(filepath.region);
+                env.problems.push(Problem::RuntimeError(runtime_error));
 
-            let (opt_var_record, references) = match opt_provided {
-                Some(params) => {
-                    let (record, can_output) =
-                        canonicalize_record(env, var_store, scope, loc_pattern.region, params);
-
-                    let references = can_output.references.clone();
-                    output.union(can_output);
-
-                    (Some((variable, Box::new(record))), references)
-                }
-                None => (None, References::new()),
-            };
-
-            let loc_expr = Loc::at(
-                loc_pattern.region,
-                Expr::ImportParams(module_id, loc_pattern.region, opt_var_record),
-            );
-
-            let def = single_can_def(
-                loc_pattern,
-                loc_expr,
-                var_store.fresh(),
-                None,
-                SendMap::default(),
-                DefKind::Let,
-            );
-
-            DefOutput {
-                output,
-                references: DefReferences::Value(references),
-                def,
-            }
-        }
-        IngestedFile(loc_pattern, opt_loc_ann, path_literal) => {
-            let relative_path =
-                if let ast::StrLiteral::PlainLine(ingested_path) = path_literal.value {
-                    ingested_path
-                } else {
-                    todo!(
-                    "Only plain strings are supported. Other cases should be made impossible here"
-                );
+                return DefOutput {
+                    output,
+                    references: DefReferences::Value(References::new()),
+                    def,
                 };
-
-            let mut file_path: PathBuf = env.module_path.into();
-            // Remove the header file name and push the new path.
-            file_path.pop();
-            file_path.push(relative_path);
-
-            let mut bytes = vec![];
-
-            let expr = match fs::File::open(&file_path)
-                .and_then(|mut file| file.read_to_end(&mut bytes))
-            {
-                Ok(_) => Expr::IngestedFile(file_path.into(), Arc::new(bytes), var_store.fresh()),
-                Err(e) => {
-                    env.problems.push(Problem::FileProblem {
-                        filename: file_path.to_path_buf(),
-                        error: e.kind(),
-                    });
-
-                    Expr::RuntimeError(RuntimeError::ReadIngestedFileError {
-                        filename: file_path.to_path_buf(),
-                        error: e.kind(),
-                        region: path_literal.region,
-                    })
-                }
             };
 
             let loc_expr = Loc::at(path_literal.region, expr);
@@ -2452,7 +1841,6 @@ fn canonicalize_pending_value_def<'a>(
                     &loc_ann.value,
                     loc_ann.region,
                     var_store,
-                    pending_abilities_in_scope,
                     AnnotationFor::Value,
                 );
 
@@ -2478,21 +1866,7 @@ fn canonicalize_pending_value_def<'a>(
                 def,
             }
         }
-    };
-
-    // Disallow ability specializations that aren't on the toplevel (note: we might loosen this
-    // restriction later on).
-    if pattern_type != PatternType::TopLevelDef {
-        if let Loc {
-            value: Pattern::AbilityMemberSpecialization { specializes, .. },
-            region,
-        } = output.def.loc_pattern
-        {
-            env.problem(Problem::NestedSpecialization(specializes, region));
-        }
     }
-
-    output
 }
 
 // TODO trim down these arguments!
@@ -2592,7 +1966,6 @@ fn canonicalize_pending_body<'a>(
                             function_var: var_store.fresh(),
                             record_var: var_store.fresh(),
                             ext_var: var_store.fresh(),
-                            closure_var: var_store.fresh(),
                             field_var: var_store.fresh(),
                             field,
                         }),
@@ -2684,7 +2057,7 @@ pub fn can_defs_with_return<'a>(
     let mut loc_expr: Loc<Expr> = ret_expr;
 
     for declaration in declarations.into_iter().rev() {
-        loc_expr = decl_to_let(declaration, loc_expr);
+        loc_expr = decl_to_let(declaration, loc_expr, env.arena);
     }
 
     (loc_expr.value, output)
@@ -2711,7 +2084,11 @@ pub fn report_unused_imports(
     }
 }
 
-fn decl_to_let(decl: Declaration, loc_ret: Loc<Expr>) -> Loc<Expr> {
+fn decl_to_let<'a>(
+    decl: Declaration<'a>,
+    loc_ret: Loc<Expr<'a>>,
+    arena: &'a Bump,
+) -> Loc<Expr<'a>> {
     match decl {
         Declaration::Declare(def) => {
             let region = Region::span_across(&def.loc_pattern.region, &loc_ret.region);
@@ -2740,9 +2117,9 @@ fn decl_to_let(decl: Declaration, loc_ret: Loc<Expr>) -> Loc<Expr> {
                 let lookups_in_cond = get_lookup_symbols(&condition);
 
                 let expr = Expr::Expect {
-                    loc_condition: Box::new(Loc::at(condition_region, condition)),
-                    loc_continuation: Box::new(loc_ret),
-                    lookups_in_cond,
+                    loc_condition: arena.alloc(Loc::at(condition_region, condition)),
+                    loc_continuation: arena.alloc(loc_ret),
+                    lookups_in_cond: lookups_in_cond.into_bump_slice(),
                 };
 
                 loc_ret = Loc::at(region, expr);
@@ -2753,13 +2130,13 @@ fn decl_to_let(decl: Declaration, loc_ret: Loc<Expr>) -> Loc<Expr> {
     }
 }
 
-fn to_pending_alias_or_opaque<'a>(
-    env: &mut Env<'a>,
+fn to_pending_alias<'a, 'b>(
+    env: &mut Env<'a, 'b>,
     scope: &mut Scope,
     name: &'a Loc<&'a str>,
     vars: &'a [Loc<ast::Pattern<'a>>],
     ann: &'a Loc<ast::TypeAnnotation<'a>>,
-    opt_derived: Option<&'a Loc<ast::ImplementsAbilities<'a>>>,
+    generated_methods_for_module: &'a ArenaVecMap<'a, Symbol, GeneratedAliasMethod>,
     kind: AliasKind,
 ) -> PendingTypeDef<'a> {
     let region = Region::span_across(&name.region, &ann.region);
@@ -2807,6 +2184,7 @@ fn to_pending_alias_or_opaque<'a>(
                     name,
                     vars: can_rigids,
                     ann,
+                    kind: AliasKind::Structural,
                 },
                 AliasKind::Opaque => PendingTypeDef::Opaque {
                     name_str,
@@ -2835,8 +2213,8 @@ fn to_pending_alias_or_opaque<'a>(
     }
 }
 
-fn to_pending_type_def<'a>(
-    env: &mut Env<'a>,
+fn to_pending_type_def<'a, 'b>(
+    env: &mut Env<'a, 'b>,
     def: &'a ast::TypeDef<'a>,
     scope: &mut Scope,
     pattern_type: PatternType,
@@ -2844,22 +2222,23 @@ fn to_pending_type_def<'a>(
     use ast::TypeDef::*;
 
     match def {
+        // TODO: can we handle builtin aliases here? e.g. List, Box, etc.
         Alias {
             header: TypeHeader { name, vars },
             ann,
-        } => to_pending_alias_or_opaque(env, scope, name, vars, ann, None, AliasKind::Structural),
+        } => to_pending_alias(env, scope, name, vars, ann, None, AliasKind::Structural),
         Opaque {
             header: TypeHeader { name, vars },
             typ: ann,
             derived,
-        } => to_pending_alias_or_opaque(
+        } => to_pending_alias(
             env,
             scope,
             name,
             vars,
             ann,
             derived.as_ref(),
-            AliasKind::Opaque,
+            AliasKind::Custom,
         ),
 
         Ability {
@@ -2953,7 +2332,6 @@ enum PendingValue<'a> {
     SignatureDefMismatch,
     InvalidIngestedFile,
     ImportNameConflict,
-    StmtAfterExpr,
 }
 
 struct PendingExpectOrDbg<'a> {
@@ -2964,31 +2342,22 @@ struct PendingExpectOrDbg<'a> {
 struct PendingModuleImport<'a> {
     module_id: ModuleId,
     region: Region,
-    exposed_symbols: Vec<(Symbol, Region)>,
-    params: PendingModuleImportParams<'a>,
+    exposed_symbols: Vec<'a, (Symbol, Region)>,
 }
 
-struct PendingModuleImportParams<'a> {
-    symbol: Symbol,
-    variable: Variable,
-    loc_pattern: Loc<Pattern>,
-    opt_provided: Option<ast::Collection<'a, Loc<AssignedField<'a, ast::Expr<'a>>>>>,
-}
-
-pub struct IntroducedImport {
+pub struct IntroducedImport<'a> {
     module_id: ModuleId,
     region: Region,
-    exposed_symbols: Vec<(Symbol, Region)>,
+    exposed_symbols: Vec<'a, (Symbol, Region)>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn to_pending_value_def<'a>(
-    env: &mut Env<'a>,
+fn to_pending_value_def<'a, 'b>(
+    env: &mut Env<'a, 'b>,
     var_store: &mut VarStore,
     def: &'a ast::ValueDef<'a>,
     region: Region,
     scope: &mut Scope,
-    pending_abilities_in_scope: &PendingAbilitiesInScope,
     output: &mut Output,
     pattern_type: PatternType,
 ) -> PendingValue<'a> {
@@ -3001,7 +2370,6 @@ fn to_pending_value_def<'a>(
                 env,
                 var_store,
                 scope,
-                pending_abilities_in_scope,
                 output,
                 pattern_type,
                 &loc_pattern.value,
@@ -3016,7 +2384,6 @@ fn to_pending_value_def<'a>(
                 env,
                 var_store,
                 scope,
-                pending_abilities_in_scope,
                 output,
                 pattern_type,
                 &loc_pattern.value,
@@ -3045,7 +2412,6 @@ fn to_pending_value_def<'a>(
                     env,
                     var_store,
                     scope,
-                    pending_abilities_in_scope,
                     output,
                     pattern_type,
                     &body_pattern.value,
@@ -3200,7 +2566,6 @@ fn to_pending_value_def<'a>(
                 module_id,
                 region,
                 exposed_symbols,
-                params,
             })
         }
         IngestedFileImport(ingested_file) => {
@@ -3228,13 +2593,7 @@ fn to_pending_value_def<'a>(
             ))
         }
         StmtAfterExpr => PendingValue::StmtAfterExpr,
-        Stmt(expr) => {
-            if env.fx_mode == FxMode::Task {
-                internal_error!("a Stmt was not desugared correctly, should have been converted to a Body(...) in desguar")
-            }
-
-            PendingValue::Def(PendingValueDef::Stmt(expr))
-        }
+        Stmt(expr) => PendingValue::Def(PendingValueDef::Stmt(expr)),
     }
 }
 

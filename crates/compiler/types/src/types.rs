@@ -3559,6 +3559,7 @@ pub enum PatternCategory {
     Set,
     Map,
     Ctor(TagName),
+    CustomCtor(Symbol, TagName),
     Opaque(Symbol),
     Str,
     Num,
