@@ -407,6 +407,10 @@ impl ModuleId {
     pub fn is_automatically_imported(self) -> bool {
         self.is_builtin()
     }
+
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
 }
 
 impl fmt::Debug for ModuleId {
@@ -675,7 +679,7 @@ mod ident_id {
             Self(raw)
         }
 
-        pub(super) const fn from_index(index: usize, suffix: IdentSuffix) -> Self {
+        pub const fn from_index(index: usize, suffix: IdentSuffix) -> Self {
             assert!(index as u32 <= UNSUFFIXED, "IdentId index too large");
 
             match suffix {
@@ -684,7 +688,7 @@ mod ident_id {
             }
         }
 
-        pub(super) const fn from_index_named(index: usize, name: &str) -> Self {
+        pub const fn from_index_named(index: usize, name: &str) -> Self {
             Self::from_index(index, IdentSuffix::from_name(name))
         }
     }

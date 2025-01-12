@@ -39,6 +39,22 @@ pub enum Problem {
     UnusedImport(Symbol, Region),
     UnusedModuleImport(ModuleId, Region),
     ExposedButNotDefined(Symbol),
+    DuplicateExposes {
+        region: Region,
+        existing_region: Region,
+    },
+    DuplicateExposesModule {
+        region: Region,
+        source: ScopeModuleSource,
+    },
+    DuplicateRequires {
+        region: Region,
+        existing_region: Region,
+    },
+    DuplicateProvides {
+        region: Region,
+        existing_region: Region,
+    },
     ImportNameConflict {
         name: ModuleName,
         is_alias: bool,
@@ -277,6 +293,10 @@ impl Problem {
             Problem::ExplicitBuiltinTypeImport(_, _) => Warning,
             Problem::ImportShadowsSymbol { .. } => RuntimeError,
             Problem::ExposedButNotDefined(_) => RuntimeError,
+            Problem::DuplicateExposes { .. } => Warning,
+            Problem::DuplicateExposesModule { .. } => Warning,
+            Problem::DuplicateRequires { .. } => Warning,
+            Problem::DuplicateProvides { .. } => Warning,
             Problem::UnusedArgument(_, _, _, _) => Warning,
             Problem::UnusedBranchDef(_, _) => Warning,
             Problem::PrecedenceProblem(_) => RuntimeError,
@@ -361,6 +381,10 @@ impl Problem {
             }
             | Problem::UnusedImport(_, region)
             | Problem::UnusedModuleImport(_, region)
+            | Problem::DuplicateExposes { region, .. }
+            | Problem::DuplicateExposesModule { region, .. }
+            | Problem::DuplicateRequires { region, .. }
+            | Problem::DuplicateProvides { region, .. }
             | Problem::ImportNameConflict {
                 new_import_region: region,
                 ..

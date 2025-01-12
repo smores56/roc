@@ -2,6 +2,7 @@
 members = [
     "crates/build/specialize_types",
     "crates/compiler/*",
+    "crates/check/*",
     "crates/vendor/*",
     "crates/fs",
     "crates/glue",
