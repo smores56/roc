@@ -246,6 +246,9 @@ pub enum Problem {
     OverAppliedDbg {
         region: Region,
     },
+    UnderAppliedTry {
+        region: Region,
+    },
     FileProblem {
         filename: PathBuf,
         error: io::ErrorKind,
@@ -276,6 +279,12 @@ pub enum Problem {
     SuffixedPureRecordField(Region),
     EmptyTupleType(Region),
     UnboundTypeVarsInAs(Region),
+    InvalidIgnoredValue {
+        field_name: Lowercase,
+        field_region: Region,
+        record_region: Region,
+    },
+    InterpolatedStringNotAllowed(Region),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +302,7 @@ impl Problem {
             Problem::UnusedDef(_, _) => Warning,
             Problem::UnusedImport(_, _) => Warning,
             Problem::UnusedModuleImport(_, _) => Warning,
+            Problem::InterpolatedStringNotAllowed(_) => RuntimeError,
             Problem::ImportNameConflict { .. } => RuntimeError,
             Problem::ExplicitBuiltinImport(_, _) => Warning,
             Problem::ExplicitBuiltinTypeImport(_, _) => Warning,
@@ -316,6 +326,7 @@ impl Problem {
             Problem::DuplicateRecordFieldValue { .. } => Warning,
             Problem::DuplicateRecordFieldType { .. } => RuntimeError,
             Problem::InvalidOptionalValue { .. } => RuntimeError,
+            Problem::InvalidIgnoredValue { .. } => RuntimeError,
             Problem::DuplicateTag { .. } => RuntimeError,
             Problem::RuntimeError(_) => RuntimeError,
             Problem::SignatureDefMismatch { .. } => RuntimeError,
@@ -358,6 +369,7 @@ impl Problem {
             Problem::OverAppliedCrash { .. } => RuntimeError,
             Problem::UnappliedDbg { .. } => RuntimeError,
             Problem::OverAppliedDbg { .. } => RuntimeError,
+            Problem::UnderAppliedTry { .. } => Warning,
             Problem::DefsOnlyUsedInRecursion(_, _) => Warning,
             Problem::FileProblem { .. } => Fatal,
             Problem::ReturnOutsideOfFunction { .. } => Warning,
@@ -395,6 +407,7 @@ impl Problem {
                 ..
             }
             | Problem::ExplicitBuiltinImport(_, region)
+            | Problem::InterpolatedStringNotAllowed(region)
             | Problem::ExplicitBuiltinTypeImport(_, region)
             | Problem::ImportShadowsSymbol { region, .. }
             | Problem::UnusedArgument {
@@ -429,6 +442,10 @@ impl Problem {
                 ..
             }
             | Problem::InvalidOptionalValue {
+                record_region: region,
+                ..
+            }
+            | Problem::InvalidIgnoredValue {
                 record_region: region,
                 ..
             }
@@ -488,6 +505,7 @@ impl Problem {
             | Problem::UnappliedCrash { region }
             | Problem::OverAppliedDbg { region }
             | Problem::UnappliedDbg { region }
+            | Problem::UnderAppliedTry { region }
             | Problem::DefsOnlyUsedInRecursion(_, region)
             | Problem::ReturnOutsideOfFunction { region, .. }
             | Problem::StatementsAfterReturn { region }
@@ -583,6 +601,11 @@ pub enum RuntimeError {
         field_name: Lowercase,
         record_region: Region,
         field_region: Region,
+    },
+    InvalidIgnoredValue {
+        field_name: Lowercase,
+        field_region: Region,
+        record_region: Region,
     },
     // Example: (5 = 1 + 2) is an unsupported pattern in an assignment; Int patterns aren't allowed in assignments!
     UnsupportedPattern(Region),
@@ -699,6 +722,8 @@ pub enum RuntimeError {
 
     NonFunctionHostedAnnotation(Region),
     CompilerProblem(CompilerProblem, Region),
+    InvalidTupleIndex(Region),
+    IngestedFilePathError(Region),
 }
 
 impl RuntimeError {
@@ -719,6 +744,7 @@ impl RuntimeError {
         match self {
             RuntimeError::Shadowing { shadow, .. } => shadow.region,
             RuntimeError::InvalidOptionalValue { field_region, .. } => *field_region,
+            RuntimeError::InvalidIgnoredValue { field_region, .. } => *field_region,
             RuntimeError::UnsupportedPattern(region)
             | RuntimeError::MalformedPattern(_, region)
             | RuntimeError::OpaqueOutsideScope {
@@ -735,6 +761,8 @@ impl RuntimeError {
             | RuntimeError::InvalidFloat(_, region, _)
             | RuntimeError::InvalidInt(_, _, region, _)
             | RuntimeError::EmptySingleQuote(region)
+            | RuntimeError::InvalidTupleIndex(region)
+            | RuntimeError::IngestedFilePathError(region)
             | RuntimeError::MultipleCharsInSingleQuote(region)
             | RuntimeError::DegenerateBranch(region)
             | RuntimeError::InvalidInterpolation(region)
